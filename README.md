@@ -12,7 +12,7 @@
       <img src="https://img.shields.io/badge/License-AGPL--3.0-red.svg" alt="License">
     </a>
     <a href="https://github.com/your-username/FerrisInfer/stargazers">
-      <img src="https://img.shields.io/github/stars/your-username/FerrisInfer?style=social" alt="Stars">
+      <img src="https://img.shields.io/github/stars/Micro-ATP/FerrisInfer?style=social" alt="Stars">
     </a>
   </p>
 </div>
