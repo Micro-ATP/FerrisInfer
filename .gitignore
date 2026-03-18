@@ -30,6 +30,12 @@ Desktop.ini
 .env.*
 !.env.example
 /.cache/
+/.cache/hf/
+/.cache/huggingface/
+/.hf/
+/.huggingface/
+/hf_home/
+/huggingface/
 /tmp/
 /temp/
 /logs/
@@ -48,6 +54,11 @@ Desktop.ini
 
 # Local model assets and experiment outputs
 /models/
+/models/**/.git/
+/models/**/.gitattributes
+/models/**/.cache/
+/models/**/*.lock
+/models/**/*.incomplete
 /weights/
 /checkpoints/
 /datasets/

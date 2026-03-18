@@ -7,5 +7,6 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+ferrisinfer-io.workspace = true
 ferrisinfer-kernel.workspace = true
 ferrisinfer-runtime.workspace = true

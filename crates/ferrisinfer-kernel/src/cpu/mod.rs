@@ -1,3 +1,4 @@
+pub mod attention;
 pub mod elementwise;
 pub mod matmul;
 pub mod reduction;
