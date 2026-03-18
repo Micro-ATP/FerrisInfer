@@ -1,0 +1,11 @@
+[package]
+name = "ferrisinfer-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+ferrisinfer-kernel.workspace = true
+ferrisinfer-runtime.workspace = true

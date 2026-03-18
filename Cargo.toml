@@ -1,0 +1,24 @@
+[workspace]
+members = [
+    "crates/ferrisinfer-cli",
+    "crates/ferrisinfer-core",
+    "crates/ferrisinfer-io",
+    "crates/ferrisinfer-kernel",
+    "crates/ferrisinfer-model",
+    "crates/ferrisinfer-runtime",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+authors = ["FerrisInfer Contributors"]
+repository = "https://github.com/Micro-ATP/FerrisInfer"
+
+[workspace.dependencies]
+ferrisinfer-core = { path = "crates/ferrisinfer-core" }
+ferrisinfer-io = { path = "crates/ferrisinfer-io" }
+ferrisinfer-kernel = { path = "crates/ferrisinfer-kernel" }
+ferrisinfer-model = { path = "crates/ferrisinfer-model" }
+ferrisinfer-runtime = { path = "crates/ferrisinfer-runtime" }

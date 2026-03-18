@@ -1,0 +1,13 @@
+[package]
+name = "ferrisinfer-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+ferrisinfer-core.workspace = true
+ferrisinfer-io.workspace = true
+ferrisinfer-kernel.workspace = true
+ferrisinfer-model.workspace = true
