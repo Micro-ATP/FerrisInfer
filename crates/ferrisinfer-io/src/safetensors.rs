@@ -66,7 +66,13 @@ impl SafeTensorEntry {
         self.data_start_offset + self.data_offsets.0
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn read_raw_bytes(&self) -> Result<Vec<u8>> {
+        let mut file = File::open(&self.path)?;
+        self.read_raw_bytes_from(&mut file)
+    }
+
+    fn read_raw_bytes_from(&self, file: &mut File) -> Result<Vec<u8>> {
         let len = usize::try_from(self.byte_len()).map_err(|_| {
             FerrisError::new(
                 ErrorKind::Runtime,
@@ -74,7 +80,6 @@ impl SafeTensorEntry {
             )
         })?;
 
-        let mut file = File::open(&self.path)?;
         file.seek(SeekFrom::Start(self.absolute_offset()))?;
         let mut bytes = vec![0u8; len];
         file.read_exact(&mut bytes)?;
@@ -174,15 +179,48 @@ impl SafeTensorsRepository {
         self.tensors.get(name)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn load_tensor_f32(&self, name: &str, transpose_2d: bool) -> Result<Tensor> {
-        let entry = self.tensors.get(name).ok_or_else(|| {
+        let entry = self.tensor_entry(name)?;
+        let source_bytes = entry.read_raw_bytes()?;
+        self.load_tensor_f32_from_bytes(name, entry, source_bytes, transpose_2d)
+    }
+
+    pub fn load_tensor_f32_cached(
+        &self,
+        name: &str,
+        transpose_2d: bool,
+        file_cache: &mut BTreeMap<PathBuf, File>,
+    ) -> Result<Tensor> {
+        let entry = self.tensor_entry(name)?;
+        let source_bytes = if let Some(file) = file_cache.get_mut(&entry.path) {
+            entry.read_raw_bytes_from(file)?
+        } else {
+            let mut file = File::open(&entry.path)?;
+            let bytes = entry.read_raw_bytes_from(&mut file)?;
+            file_cache.insert(entry.path.clone(), file);
+            bytes
+        };
+
+        self.load_tensor_f32_from_bytes(name, entry, source_bytes, transpose_2d)
+    }
+
+    fn tensor_entry(&self, name: &str) -> Result<&SafeTensorEntry> {
+        self.tensors.get(name).ok_or_else(|| {
             FerrisError::new(
                 ErrorKind::MissingWeight,
                 format!("tensor '{name}' was not found in safetensors repository"),
             )
-        })?;
+        })
+    }
 
-        let source_bytes = entry.read_raw_bytes()?;
+    fn load_tensor_f32_from_bytes(
+        &self,
+        name: &str,
+        entry: &SafeTensorEntry,
+        source_bytes: Vec<u8>,
+        transpose_2d: bool,
+    ) -> Result<Tensor> {
         let expected_len = checked_tensor_byte_len(entry.dtype, &entry.shape)?;
         if source_bytes.len() != expected_len {
             return Err(FerrisError::new(
@@ -195,9 +233,9 @@ impl SafeTensorsRepository {
         }
 
         let output_shape = output_shape(&entry.shape, transpose_2d)?;
-        let output_bytes =
-            convert_to_f32_bytes(entry.dtype, &entry.shape, &source_bytes, transpose_2d)?;
-        Tensor::from_owned_bytes(DType::F32, shape_from_dims(output_shape)?, output_bytes)
+        let output_values =
+            convert_to_f32_vec(entry.dtype, &entry.shape, &source_bytes, transpose_2d)?;
+        Tensor::from_f32_vec(shape_from_dims(output_shape)?, output_values)
     }
 }
 
@@ -396,18 +434,18 @@ fn element_count(shape: &[usize]) -> Result<usize> {
     Ok(count)
 }
 
-fn convert_to_f32_bytes(
+fn convert_to_f32_vec(
     dtype: SafeTensorDType,
     shape: &[usize],
     source: &[u8],
     transpose_2d: bool,
-) -> Result<Vec<u8>> {
+) -> Result<Vec<f32>> {
     if dtype == SafeTensorDType::F32 && !transpose_2d {
-        return Ok(source.to_vec());
+        return raw_f32_bytes_to_vec(source);
     }
 
     let elements = element_count(shape)?;
-    let mut output = vec![0u8; elements * DType::F32.size_in_bytes()];
+    let mut output = vec![0.0f32; elements];
     let rows = if transpose_2d { shape[0] } else { 0 };
     let cols = if transpose_2d { shape[1] } else { 0 };
 
@@ -426,10 +464,43 @@ fn convert_to_f32_bytes(
             index
         };
 
-        write_f32(&mut output, output_index, value)?;
+        output[output_index] = value;
     }
 
     Ok(output)
+}
+
+fn raw_f32_bytes_to_vec(source: &[u8]) -> Result<Vec<f32>> {
+    if source.len() % DType::F32.size_in_bytes() != 0 {
+        return Err(FerrisError::new(
+            ErrorKind::InvalidType,
+            "source tensor bytes are truncated for f32 read",
+        ));
+    }
+
+    #[cfg(target_endian = "little")]
+    {
+        let len = source.len() / DType::F32.size_in_bytes();
+        let mut values = Vec::<f32>::with_capacity(len);
+        unsafe {
+            values.set_len(len);
+            std::ptr::copy_nonoverlapping(
+                source.as_ptr(),
+                values.as_mut_ptr() as *mut u8,
+                source.len(),
+            );
+        }
+        Ok(values)
+    }
+
+    #[cfg(not(target_endian = "little"))]
+    {
+        let mut values = Vec::with_capacity(source.len() / DType::F32.size_in_bytes());
+        for chunk in source.chunks_exact(DType::F32.size_in_bytes()) {
+            values.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+        Ok(values)
+    }
 }
 
 fn read_u16(source: &[u8], index: usize) -> Result<u16> {
@@ -464,24 +535,6 @@ fn read_f32(source: &[u8], index: usize) -> Result<f32> {
     })?;
 
     Ok(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-}
-
-fn write_f32(output: &mut [u8], index: usize, value: f32) -> Result<()> {
-    let start = index
-        .checked_mul(4)
-        .ok_or_else(|| FerrisError::new(ErrorKind::Runtime, "f32 tensor byte offset overflow"))?;
-    let end = start
-        .checked_add(4)
-        .ok_or_else(|| FerrisError::new(ErrorKind::Runtime, "f32 tensor byte range overflow"))?;
-    let bytes = output.get_mut(start..end).ok_or_else(|| {
-        FerrisError::new(
-            ErrorKind::InvalidType,
-            "output tensor bytes are truncated for f32 write",
-        )
-    })?;
-
-    bytes.copy_from_slice(&value.to_le_bytes());
-    Ok(())
 }
 
 fn bf16_to_f32(bits: u16) -> f32 {

@@ -1,10 +1,12 @@
 use std::env;
 use std::fs;
 use std::process;
+use std::thread;
 use std::time::Instant;
 
 use ferrisinfer_io::{ChatMessage, HfSource, ModelSource, Tokenizer, VocabularyTokenizer};
 use ferrisinfer_kernel::{Backend, CpuBackend};
+use ferrisinfer_model::DecoderOnlyModel;
 use ferrisinfer_runtime::{ExecutionMode, GenerationRequest, InferenceEngine, SessionConfig};
 
 const DEFAULT_HF_PATH: &str = "models/Qwen2.5-0.5B-Instruct";
@@ -21,16 +23,20 @@ fn main() {
             Ok(())
         }
         Some("inspect-hf") => inspect_hf(args.get(2).map(String::as_str)),
+        Some("profile-hf-load") => profile_hf_load(args.get(2).map(String::as_str)),
         Some("render-chat-hf") => render_chat_hf(args.get(2).map(String::as_str)),
-        Some("render-chat-hf-short") => {
-            render_chat_hf_with_prompt(args.get(2).map(String::as_str), default_short_system_prompt_path())
-        }
+        Some("render-chat-hf-short") => render_chat_hf_with_prompt(
+            args.get(2).map(String::as_str),
+            default_short_system_prompt_path(),
+        ),
         Some("tokenize-hf") => tokenize_hf(args.get(2).map(String::as_str)),
         Some("tokenize-file-hf") => tokenize_file_hf(args.get(2).map(String::as_str)),
         Some("smoke-hf") => smoke_hf(&engine, args.get(2).map(String::as_str)),
-        Some("smoke-hf-short") => {
-            smoke_hf_with_prompt(&engine, args.get(2).map(String::as_str), default_short_system_prompt_path())
-        }
+        Some("smoke-hf-short") => smoke_hf_with_prompt(
+            &engine,
+            args.get(2).map(String::as_str),
+            default_short_system_prompt_path(),
+        ),
         Some("generate-hf") => generate_hf(
             &engine,
             args.get(2).map(String::as_str),
@@ -64,6 +70,9 @@ fn print_help() {
     println!("  help                           Show this message");
     println!("  plan                           Print the current implementation framework");
     println!("  inspect-hf [path]              Inspect a local Hugging Face model directory");
+    println!(
+        "  profile-hf-load [path]         Measure config/tokenizer/weights/model load timings"
+    );
     println!(
         "  render-chat-hf [text]          Render the default Qwen chat prompt for a user message"
     );
@@ -188,6 +197,64 @@ fn inspect_hf(path: Option<&str>) -> Result<(), ()> {
             "no"
         }
     );
+    Ok(())
+}
+
+fn profile_hf_load(path: Option<&str>) -> Result<(), ()> {
+    let path = path.unwrap_or(default_hf_path());
+    let mut source = HfSource::new(path);
+    let available_parallelism = thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1);
+
+    let total_start = Instant::now();
+
+    let config_start = Instant::now();
+    let config = source.load_config().map_err(|error| {
+        eprintln!("failed to load config from '{}': {}", path, error);
+    })?;
+    let config_elapsed = config_start.elapsed();
+
+    let tokenizer_start = Instant::now();
+    let tokenizer = source.load_tokenizer().map_err(|error| {
+        eprintln!("failed to load tokenizer from '{}': {}", path, error);
+    })?;
+    let tokenizer_elapsed = tokenizer_start.elapsed();
+
+    let weights_start = Instant::now();
+    let weights = source.load_weights().map_err(|error| {
+        eprintln!("failed to load weights from '{}': {}", path, error);
+    })?;
+    let weights_elapsed = weights_start.elapsed();
+    let weight_count = weights.len();
+
+    let model_build_start = Instant::now();
+    let model = DecoderOnlyModel::new(config, weights).map_err(|error| {
+        eprintln!("failed to build model from '{}': {}", path, error);
+    })?;
+    let model_build_elapsed = model_build_start.elapsed();
+    let total_elapsed = total_start.elapsed();
+
+    println!("FerrisInfer Hugging Face load profile");
+    println!("path: {}", source.path().display());
+    println!("available parallelism: {}", available_parallelism);
+    println!(
+        "model: hidden={} intermediate={} layers={} vocab={}",
+        model.config().hidden_size,
+        model.config().intermediate_size,
+        model.config().num_layers,
+        model.config().vocab_size
+    );
+    println!(
+        "tokenizer: kind={:?} vocab={} bos={:?} eos={:?}",
+        tokenizer.kind, tokenizer.vocab_size, tokenizer.bos_token_id, tokenizer.eos_token_id
+    );
+    println!("loaded tensors: {}", weight_count);
+    println!("config elapsed: {:.3?}", config_elapsed);
+    println!("tokenizer elapsed: {:.3?}", tokenizer_elapsed);
+    println!("weights elapsed: {:.3?}", weights_elapsed);
+    println!("model build elapsed: {:.3?}", model_build_elapsed);
+    println!("total elapsed: {:.3?}", total_elapsed);
     Ok(())
 }
 
@@ -409,14 +476,14 @@ fn load_default_hf_tokenizer() -> Result<VocabularyTokenizer, ()> {
 
 fn load_system_prompt(path: &str) -> Result<String, ()> {
     let text = fs::read_to_string(path).map_err(|error| {
-        eprintln!(
-            "failed to read system prompt '{}': {}",
-            path, error
-        );
+        eprintln!("failed to read system prompt '{}': {}", path, error);
     })?;
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        eprintln!("system prompt '{}' is empty after trimming whitespace", path);
+        eprintln!(
+            "system prompt '{}' is empty after trimming whitespace",
+            path
+        );
         return Err(());
     }
     Ok(trimmed.to_string())

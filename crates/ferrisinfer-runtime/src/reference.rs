@@ -1,7 +1,7 @@
 use ferrisinfer_core::{DType, ErrorKind, FerrisError, Result, Shape, Tensor};
 use ferrisinfer_kernel::cpu::attention::{
-    causal_self_attention_f32, decode_causal_attention_f32, embedding_gather_f32,
-    merge_heads_f32, rope_f32, split_heads_f32,
+    causal_self_attention_f32, decode_causal_attention_f32, embedding_gather_f32, merge_heads_f32,
+    rope_f32, split_heads_f32,
 };
 use ferrisinfer_kernel::cpu::elementwise::{add_f32, mul_f32, silu_f32};
 use ferrisinfer_kernel::cpu::matmul::matmul_f32;
@@ -46,8 +46,7 @@ pub fn decoder_block_forward_f32(
     weights: &ReferenceDecoderBlockWeights<'_>,
     config: ReferenceBlockConfig,
 ) -> Result<Tensor> {
-    let (output, _, _) =
-        decoder_block_forward_with_kv_capture_f32(input, weights, config, 0)?;
+    let (output, _, _) = decoder_block_forward_with_kv_capture_f32(input, weights, config, 0)?;
     Ok(output)
 }
 
@@ -975,13 +974,15 @@ fn merge_argmax_projection_chunks(
         ArgmaxProjectionChunk {
             best_index: left.best_index,
             max_logit: left.max_logit,
-            scaled_sum: left.scaled_sum + right.scaled_sum * (right.max_logit - left.max_logit).exp(),
+            scaled_sum: left.scaled_sum
+                + right.scaled_sum * (right.max_logit - left.max_logit).exp(),
         }
     } else {
         ArgmaxProjectionChunk {
             best_index: right.best_index,
             max_logit: right.max_logit,
-            scaled_sum: right.scaled_sum + left.scaled_sum * (left.max_logit - right.max_logit).exp(),
+            scaled_sum: right.scaled_sum
+                + left.scaled_sum * (left.max_logit - right.max_logit).exp(),
         }
     }
 }
@@ -1290,9 +1291,13 @@ mod tests {
         let mut last_logits = None;
 
         for (position, token_id) in [0u32, 1u32].iter().copied().enumerate() {
-            let sample =
-                decoder_model_token_sample_with_kv_cache_f32(&model, token_id, &mut kv_cache, position)
-                    .unwrap();
+            let sample = decoder_model_token_sample_with_kv_cache_f32(
+                &model,
+                token_id,
+                &mut kv_cache,
+                position,
+            )
+            .unwrap();
             let logits = decoder_model_token_logits_with_kv_cache_f32(
                 &model,
                 token_id,
@@ -1325,9 +1330,12 @@ mod tests {
         })
         .unwrap();
 
-        let logits =
-            decoder_model_prefill_last_token_logits_with_kv_cache_f32(&model, &[0, 1], &mut kv_cache)
-                .unwrap();
+        let logits = decoder_model_prefill_last_token_logits_with_kv_cache_f32(
+            &model,
+            &[0, 1],
+            &mut kv_cache,
+        )
+        .unwrap();
         kv_cache.advance(2).unwrap();
         let full_last_logits = decoder_model_last_token_logits_f32(&model, &[0, 1]).unwrap();
 
@@ -1359,12 +1367,18 @@ mod tests {
         })
         .unwrap();
 
-        let sample =
-            decoder_model_prefill_last_token_sample_with_kv_cache_f32(&model, &[0, 1], &mut sample_cache)
-                .unwrap();
-        let logits =
-            decoder_model_prefill_last_token_logits_with_kv_cache_f32(&model, &[0, 1], &mut logits_cache)
-                .unwrap();
+        let sample = decoder_model_prefill_last_token_sample_with_kv_cache_f32(
+            &model,
+            &[0, 1],
+            &mut sample_cache,
+        )
+        .unwrap();
+        let logits = decoder_model_prefill_last_token_logits_with_kv_cache_f32(
+            &model,
+            &[0, 1],
+            &mut logits_cache,
+        )
+        .unwrap();
         let expected = crate::sampler::argmax_last_token(&logits).unwrap();
 
         assert_eq!(sample.token_id, expected.token_id);

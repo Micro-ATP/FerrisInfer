@@ -317,7 +317,11 @@ impl Tensor {
         Ok(())
     }
 
-    pub fn copy_from_tensor_f32_at(&mut self, element_offset: usize, source: &Tensor) -> Result<()> {
+    pub fn copy_from_tensor_f32_at(
+        &mut self,
+        element_offset: usize,
+        source: &Tensor,
+    ) -> Result<()> {
         self.ensure_dtype(DType::F32)?;
         self.ensure_contiguous()?;
         source.ensure_dtype(DType::F32)?;
@@ -326,9 +330,11 @@ impl Tensor {
         if let (Storage::OwnedF32(destination), Ok(source_values)) =
             (&mut self.storage, source.as_f32_slice())
         {
-            let end = element_offset.checked_add(source_values.len()).ok_or_else(|| {
-                FerrisError::new(ErrorKind::Runtime, "tensor element range overflow")
-            })?;
+            let end = element_offset
+                .checked_add(source_values.len())
+                .ok_or_else(|| {
+                    FerrisError::new(ErrorKind::Runtime, "tensor element range overflow")
+                })?;
             if end > destination.len() {
                 return Err(FerrisError::new(
                     ErrorKind::InvalidShape,
@@ -423,11 +429,7 @@ impl Tensor {
         self.element_byte_range_span(index, 1)
     }
 
-    fn element_byte_range_span(
-        &self,
-        index: usize,
-        element_count: usize,
-    ) -> Result<Range<usize>> {
+    fn element_byte_range_span(&self, index: usize, element_count: usize) -> Result<Range<usize>> {
         if index > self.element_count() {
             return Err(FerrisError::new(
                 ErrorKind::InvalidShape,
@@ -438,9 +440,9 @@ impl Tensor {
             ));
         }
 
-        let end_index = index.checked_add(element_count).ok_or_else(|| {
-            FerrisError::new(ErrorKind::Runtime, "tensor element range overflow")
-        })?;
+        let end_index = index
+            .checked_add(element_count)
+            .ok_or_else(|| FerrisError::new(ErrorKind::Runtime, "tensor element range overflow"))?;
         if end_index > self.element_count() {
             return Err(FerrisError::new(
                 ErrorKind::InvalidShape,
@@ -509,11 +511,29 @@ fn bytes_to_f32_vec(bytes: &[u8]) -> Result<Vec<f32>> {
         ));
     }
 
-    let mut values = Vec::with_capacity(bytes.len() / DType::F32.size_in_bytes());
-    for chunk in bytes.chunks_exact(DType::F32.size_in_bytes()) {
-        values.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    #[cfg(target_endian = "little")]
+    {
+        let len = bytes.len() / DType::F32.size_in_bytes();
+        let mut values = Vec::<f32>::with_capacity(len);
+        unsafe {
+            values.set_len(len);
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                values.as_mut_ptr() as *mut u8,
+                bytes.len(),
+            );
+        }
+        Ok(values)
     }
-    Ok(values)
+
+    #[cfg(not(target_endian = "little"))]
+    {
+        let mut values = Vec::with_capacity(bytes.len() / DType::F32.size_in_bytes());
+        for chunk in bytes.chunks_exact(DType::F32.size_in_bytes()) {
+            values.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+        Ok(values)
+    }
 }
 
 #[cfg(test)]
@@ -564,7 +584,8 @@ mod tests {
     fn copy_from_tensor_f32_at_updates_subrange() {
         let mut destination =
             Tensor::from_f32_vec(Shape::from_slice(&[6]).unwrap(), vec![0.0; 6]).unwrap();
-        let source = Tensor::from_f32_vec(Shape::from_slice(&[2]).unwrap(), vec![3.0, 4.0]).unwrap();
+        let source =
+            Tensor::from_f32_vec(Shape::from_slice(&[2]).unwrap(), vec![3.0, 4.0]).unwrap();
 
         destination.copy_from_tensor_f32_at(2, &source).unwrap();
 

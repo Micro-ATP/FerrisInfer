@@ -542,7 +542,8 @@ fn compute_decode_attention_head_chunk(
             for dim in 0..head_dim {
                 let key_index =
                     attention_index(attended_position, kv_head, dim, num_kv_heads, head_dim);
-                score += query_values[query_base + dim] * read_packed_f32(cached_key_bytes, key_index);
+                score +=
+                    query_values[query_base + dim] * read_packed_f32(cached_key_bytes, key_index);
             }
             score *= scale;
             max_score = max_score.max(score);
@@ -572,12 +573,11 @@ fn compute_decode_attention_head_chunk(
             {
                 let value_index =
                     attention_index(attended_position, kv_head, dim, num_kv_heads, head_dim);
-                weighted_sum +=
-                    (normalized_score / score_sum) * read_packed_f32(cached_value_bytes, value_index);
+                weighted_sum += (normalized_score / score_sum)
+                    * read_packed_f32(cached_value_bytes, value_index);
             }
 
-            weighted_sum +=
-                (scores[cache_len] / score_sum) * value_slot_values[slot_base + dim];
+            weighted_sum += (scores[cache_len] / score_sum) * value_slot_values[slot_base + dim];
             out_chunk[out_index] = weighted_sum;
         }
     }

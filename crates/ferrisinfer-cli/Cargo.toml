@@ -9,4 +9,5 @@ repository.workspace = true
 [dependencies]
 ferrisinfer-io.workspace = true
 ferrisinfer-kernel.workspace = true
+ferrisinfer-model.workspace = true
 ferrisinfer-runtime.workspace = true

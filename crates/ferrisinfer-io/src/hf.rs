@@ -1,8 +1,9 @@
-use std::collections::HashMap;
-use std::fs;
+use std::collections::{BTreeMap, HashMap};
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
+use std::thread;
 
-use ferrisinfer_core::{ErrorKind, FerrisError, Result};
+use ferrisinfer_core::{ErrorKind, FerrisError, Result, Tensor};
 use ferrisinfer_model::{
     ActivationKind, ArchitectureKind, AttentionLayout, AttentionSpec, MlpSpec, ModelConfig,
     NormKind, NormSpec, RopeScalingKind, RopeSpec, WeightMap,
@@ -212,35 +213,94 @@ impl ModelSource for HfSource {
         let plans = tensor_plans_for_family(&family, &config)?;
 
         let mut weights = WeightMap::new();
-        for plan in plans {
-            let Some(entry) = repository.get(&plan.external_name) else {
-                if plan.required {
-                    return Err(FerrisError::new(
-                        ErrorKind::MissingWeight,
-                        format!("missing required tensor '{}'", plan.external_name),
-                    ));
-                }
-                continue;
-            };
-
-            if entry.shape() != plan.expected_source_shape.as_slice() {
-                return Err(FerrisError::new(
-                    ErrorKind::InvalidShape,
-                    format!(
-                        "tensor '{}' expected shape {:?} but found {:?}",
-                        plan.external_name,
-                        plan.expected_source_shape,
-                        entry.shape()
-                    ),
-                ));
-            }
-
-            let tensor = repository.load_tensor_f32(&plan.external_name, plan.transpose_2d)?;
-            weights.insert(plan.internal_name, tensor);
+        for (internal_name, tensor) in load_planned_weights(&repository, &plans)? {
+            weights.insert(internal_name, tensor);
         }
 
         Ok(weights)
     }
+}
+
+fn load_planned_weights(
+    repository: &SafeTensorsRepository,
+    plans: &[TensorPlan],
+) -> Result<Vec<(String, Tensor)>> {
+    if plans.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let worker_count = thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .min(plans.len());
+
+    if worker_count <= 1 {
+        return load_planned_weight_chunk(repository, plans);
+    }
+
+    let chunk_size = plans.len().div_ceil(worker_count);
+    thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for chunk in plans.chunks(chunk_size) {
+            handles.push(scope.spawn(move || load_planned_weight_chunk(repository, chunk)));
+        }
+
+        let mut loaded = Vec::with_capacity(plans.len());
+        for handle in handles {
+            let chunk_weights = handle.join().map_err(|_| {
+                FerrisError::new(ErrorKind::Runtime, "parallel weight loading panicked")
+            })??;
+            loaded.extend(chunk_weights);
+        }
+
+        Ok(loaded)
+    })
+}
+
+fn load_planned_weight_chunk(
+    repository: &SafeTensorsRepository,
+    plans: &[TensorPlan],
+) -> Result<Vec<(String, Tensor)>> {
+    let mut file_cache = BTreeMap::<PathBuf, File>::new();
+    let mut loaded = Vec::with_capacity(plans.len());
+    for plan in plans {
+        if let Some(weight) = load_planned_weight(repository, plan, &mut file_cache)? {
+            loaded.push(weight);
+        }
+    }
+    Ok(loaded)
+}
+
+fn load_planned_weight(
+    repository: &SafeTensorsRepository,
+    plan: &TensorPlan,
+    file_cache: &mut BTreeMap<PathBuf, File>,
+) -> Result<Option<(String, Tensor)>> {
+    let Some(entry) = repository.get(&plan.external_name) else {
+        if plan.required {
+            return Err(FerrisError::new(
+                ErrorKind::MissingWeight,
+                format!("missing required tensor '{}'", plan.external_name),
+            ));
+        }
+        return Ok(None);
+    };
+
+    if entry.shape() != plan.expected_source_shape.as_slice() {
+        return Err(FerrisError::new(
+            ErrorKind::InvalidShape,
+            format!(
+                "tensor '{}' expected shape {:?} but found {:?}",
+                plan.external_name,
+                plan.expected_source_shape,
+                entry.shape()
+            ),
+        ));
+    }
+
+    let tensor =
+        repository.load_tensor_f32_cached(&plan.external_name, plan.transpose_2d, file_cache)?;
+    Ok(Some((plan.internal_name.clone(), tensor)))
 }
 
 fn parse_model_config(root: &JsonValue) -> Result<ModelConfig> {

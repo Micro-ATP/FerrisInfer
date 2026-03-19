@@ -201,9 +201,9 @@ impl KvCache {
         }
 
         let slot_width = self.config.num_kv_heads * self.config.head_dim;
-        let element_offset = start_position
-            .checked_mul(slot_width)
-            .ok_or_else(|| FerrisError::new(ErrorKind::Runtime, "KV cache write offset overflow"))?;
+        let element_offset = start_position.checked_mul(slot_width).ok_or_else(|| {
+            FerrisError::new(ErrorKind::Runtime, "KV cache write offset overflow")
+        })?;
         let layer = self.layers.get_mut(layer_index).ok_or_else(|| {
             FerrisError::new(
                 ErrorKind::InvalidShape,
@@ -273,11 +273,21 @@ impl KvCache {
         let shape = Shape::from_slice(&[length, self.config.num_kv_heads, self.config.head_dim])?;
         let prefix_bytes = prefix_elements
             .checked_mul(DType::F32.size_in_bytes())
-            .ok_or_else(|| FerrisError::new(ErrorKind::Runtime, "KV cache prefix byte size overflow"))?;
+            .ok_or_else(|| {
+                FerrisError::new(ErrorKind::Runtime, "KV cache prefix byte size overflow")
+            })?;
 
         Ok((
-            Tensor::from_owned_bytes(DType::F32, shape.clone(), layer.key.as_bytes()[..prefix_bytes].to_vec())?,
-            Tensor::from_owned_bytes(DType::F32, shape, layer.value.as_bytes()[..prefix_bytes].to_vec())?,
+            Tensor::from_owned_bytes(
+                DType::F32,
+                shape.clone(),
+                layer.key.as_bytes()[..prefix_bytes].to_vec(),
+            )?,
+            Tensor::from_owned_bytes(
+                DType::F32,
+                shape,
+                layer.value.as_bytes()[..prefix_bytes].to_vec(),
+            )?,
         ))
     }
 
