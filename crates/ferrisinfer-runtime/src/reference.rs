@@ -1,9 +1,8 @@
 use ferrisinfer_core::{DType, ErrorKind, FerrisError, Result, Shape, Tensor};
 use ferrisinfer_kernel::cpu::attention::{
-    causal_self_attention_f32, decode_causal_attention_f32, embedding_gather_f32, merge_heads_f32,
-    rope_f32, split_heads_f32,
+    causal_self_attention_f32, decode_causal_attention_f32, embedding_gather_f32, rope_f32,
 };
-use ferrisinfer_kernel::cpu::elementwise::{add_f32, mul_f32, silu_f32};
+use ferrisinfer_kernel::cpu::elementwise::{add_f32_in_place, mul_f32_in_place, silu_f32_in_place};
 use ferrisinfer_kernel::cpu::matmul::matmul_f32;
 use ferrisinfer_kernel::cpu::reduction::rms_norm_f32;
 use ferrisinfer_model::{ActivationKind, AttentionLayout, DecoderOnlyModel, ModelConfig, NormKind};
@@ -222,12 +221,10 @@ fn decoder_block_forward_with_kv_capture_f32(
     linear_f32_with_bias(&normed, weights.wk, weights.wk_bias, &mut key)?;
     linear_f32_with_bias(&normed, weights.wv, weights.wv_bias, &mut value)?;
 
-    let mut query_heads = zeros_3d(seq_len, config.num_heads, config.head_dim)?;
-    let mut key_heads = zeros_3d(seq_len, config.num_kv_heads, config.head_dim)?;
-    let mut value_heads = zeros_3d(seq_len, config.num_kv_heads, config.head_dim)?;
-    split_heads_f32(&query, config.num_heads, &mut query_heads)?;
-    split_heads_f32(&key, config.num_kv_heads, &mut key_heads)?;
-    split_heads_f32(&value, config.num_kv_heads, &mut value_heads)?;
+    let mut query_heads =
+        reshape_heads_2d_to_3d(query, seq_len, config.num_heads, config.head_dim)?;
+    let mut key_heads = reshape_heads_2d_to_3d(key, seq_len, config.num_kv_heads, config.head_dim)?;
+    let value_heads = reshape_heads_2d_to_3d(value, seq_len, config.num_kv_heads, config.head_dim)?;
 
     rope_f32(
         &mut query_heads,
@@ -240,10 +237,9 @@ fn decoder_block_forward_with_kv_capture_f32(
     let mut attention_heads = zeros_3d(seq_len, config.num_heads, config.head_dim)?;
     causal_self_attention_f32(&query_heads, &key_heads, &value_heads, &mut attention_heads)?;
 
-    let mut attention_merged = zeros_2d(seq_len, hidden_size)?;
-    merge_heads_f32(&attention_heads, &mut attention_merged)?;
+    let attention_merged = reshape_heads_3d_to_2d(attention_heads, seq_len, hidden_size)?;
 
-    let mut attention_projected = zeros_2d(seq_len, hidden_size)?;
+    let mut attention_projected = normed;
     linear_f32_with_bias(
         &attention_merged,
         weights.wo,
@@ -251,10 +247,10 @@ fn decoder_block_forward_with_kv_capture_f32(
         &mut attention_projected,
     )?;
 
-    let mut residual = zeros_2d(seq_len, hidden_size)?;
-    add_f32(input, &attention_projected, &mut residual)?;
+    let mut residual = attention_projected;
+    add_f32_in_place(&mut residual, input)?;
 
-    let mut ffn_input = zeros_2d(seq_len, hidden_size)?;
+    let mut ffn_input = attention_merged;
     rms_norm_f32(
         &residual,
         weights.ffn_norm,
@@ -262,9 +258,9 @@ fn decoder_block_forward_with_kv_capture_f32(
         config.rms_norm_epsilon,
     )?;
 
-    let mut up_projection = zeros_2d(seq_len, config.intermediate_size)?;
+    let mut gated_product = zeros_2d(seq_len, config.intermediate_size)?;
     let mut gate_projection = zeros_2d(seq_len, config.intermediate_size)?;
-    linear_f32_with_bias(&ffn_input, weights.w1, weights.w1_bias, &mut up_projection)?;
+    linear_f32_with_bias(&ffn_input, weights.w1, weights.w1_bias, &mut gated_product)?;
     linear_f32_with_bias(
         &ffn_input,
         weights.w3,
@@ -272,18 +268,14 @@ fn decoder_block_forward_with_kv_capture_f32(
         &mut gate_projection,
     )?;
 
-    let mut gated_activation = zeros_2d(seq_len, config.intermediate_size)?;
-    silu_f32(&gate_projection, &mut gated_activation)?;
+    silu_f32_in_place(&mut gate_projection)?;
+    mul_f32_in_place(&mut gated_product, &gate_projection)?;
 
-    let mut gated_product = zeros_2d(seq_len, config.intermediate_size)?;
-    mul_f32(&up_projection, &gated_activation, &mut gated_product)?;
-
-    let mut mlp_output = zeros_2d(seq_len, hidden_size)?;
+    let mut mlp_output = ffn_input;
     linear_f32_with_bias(&gated_product, weights.w2, weights.w2_bias, &mut mlp_output)?;
 
-    let mut output = zeros_2d(seq_len, hidden_size)?;
-    add_f32(&residual, &mlp_output, &mut output)?;
-    Ok((output, key_heads, value_heads))
+    add_f32_in_place(&mut mlp_output, &residual)?;
+    Ok((mlp_output, key_heads, value_heads))
 }
 
 pub fn decoder_model_forward_f32(model: &DecoderOnlyModel, token_ids: &[u32]) -> Result<Tensor> {
@@ -449,12 +441,9 @@ fn decoder_block_decode_step_f32(
     linear_f32_with_bias(&normed, weights.wk, weights.wk_bias, &mut key)?;
     linear_f32_with_bias(&normed, weights.wv, weights.wv_bias, &mut value)?;
 
-    let mut query_heads = zeros_3d(1, config.num_heads, config.head_dim)?;
-    let mut key_heads = zeros_3d(1, config.num_kv_heads, config.head_dim)?;
-    let mut value_heads = zeros_3d(1, config.num_kv_heads, config.head_dim)?;
-    split_heads_f32(&query, config.num_heads, &mut query_heads)?;
-    split_heads_f32(&key, config.num_kv_heads, &mut key_heads)?;
-    split_heads_f32(&value, config.num_kv_heads, &mut value_heads)?;
+    let mut query_heads = reshape_heads_2d_to_3d(query, 1, config.num_heads, config.head_dim)?;
+    let mut key_heads = reshape_heads_2d_to_3d(key, 1, config.num_kv_heads, config.head_dim)?;
+    let value_heads = reshape_heads_2d_to_3d(value, 1, config.num_kv_heads, config.head_dim)?;
 
     rope_f32(
         &mut query_heads,
@@ -464,8 +453,8 @@ fn decoder_block_decode_step_f32(
         config.rope_theta,
     )?;
 
-    let key_slot = attention_slot_tensor_f32(&key_heads, config.num_kv_heads, config.head_dim)?;
-    let value_slot = attention_slot_tensor_f32(&value_heads, config.num_kv_heads, config.head_dim)?;
+    let key_slot = attention_slot_tensor_f32(key_heads, config.num_kv_heads, config.head_dim)?;
+    let value_slot = attention_slot_tensor_f32(value_heads, config.num_kv_heads, config.head_dim)?;
     let cache_layer = kv_cache.layer(layer_index)?;
 
     let mut attention_heads = zeros_3d(1, config.num_heads, config.head_dim)?;
@@ -481,10 +470,9 @@ fn decoder_block_decode_step_f32(
 
     kv_cache.write_uncommitted_f32(layer_index, position, &key_slot, &value_slot)?;
 
-    let mut attention_merged = zeros_2d(1, hidden_size)?;
-    merge_heads_f32(&attention_heads, &mut attention_merged)?;
+    let attention_merged = reshape_heads_3d_to_2d(attention_heads, 1, hidden_size)?;
 
-    let mut attention_projected = zeros_2d(1, hidden_size)?;
+    let mut attention_projected = normed;
     linear_f32_with_bias(
         &attention_merged,
         weights.wo,
@@ -492,10 +480,10 @@ fn decoder_block_decode_step_f32(
         &mut attention_projected,
     )?;
 
-    let mut residual = zeros_2d(1, hidden_size)?;
-    add_f32(input, &attention_projected, &mut residual)?;
+    let mut residual = attention_projected;
+    add_f32_in_place(&mut residual, input)?;
 
-    let mut ffn_input = zeros_2d(1, hidden_size)?;
+    let mut ffn_input = attention_merged;
     rms_norm_f32(
         &residual,
         weights.ffn_norm,
@@ -503,9 +491,9 @@ fn decoder_block_decode_step_f32(
         config.rms_norm_epsilon,
     )?;
 
-    let mut up_projection = zeros_2d(1, config.intermediate_size)?;
+    let mut gated_product = zeros_2d(1, config.intermediate_size)?;
     let mut gate_projection = zeros_2d(1, config.intermediate_size)?;
-    linear_f32_with_bias(&ffn_input, weights.w1, weights.w1_bias, &mut up_projection)?;
+    linear_f32_with_bias(&ffn_input, weights.w1, weights.w1_bias, &mut gated_product)?;
     linear_f32_with_bias(
         &ffn_input,
         weights.w3,
@@ -513,18 +501,14 @@ fn decoder_block_decode_step_f32(
         &mut gate_projection,
     )?;
 
-    let mut gated_activation = zeros_2d(1, config.intermediate_size)?;
-    silu_f32(&gate_projection, &mut gated_activation)?;
+    silu_f32_in_place(&mut gate_projection)?;
+    mul_f32_in_place(&mut gated_product, &gate_projection)?;
 
-    let mut gated_product = zeros_2d(1, config.intermediate_size)?;
-    mul_f32(&up_projection, &gated_activation, &mut gated_product)?;
-
-    let mut mlp_output = zeros_2d(1, hidden_size)?;
+    let mut mlp_output = ffn_input;
     linear_f32_with_bias(&gated_product, weights.w2, weights.w2_bias, &mut mlp_output)?;
 
-    let mut output = zeros_2d(1, hidden_size)?;
-    add_f32(&residual, &mlp_output, &mut output)?;
-    Ok(output)
+    add_f32_in_place(&mut mlp_output, &residual)?;
+    Ok(mlp_output)
 }
 
 fn output_weight<'a>(model: &'a DecoderOnlyModel) -> Result<&'a Tensor> {
@@ -642,7 +626,7 @@ fn get_optional_weight<'a>(model: &'a DecoderOnlyModel, name: &str) -> Option<&'
 }
 
 fn attention_slot_tensor_f32(
-    tensor: &Tensor,
+    tensor: Tensor,
     num_kv_heads: usize,
     head_dim: usize,
 ) -> Result<Tensor> {
@@ -656,10 +640,20 @@ fn attention_slot_tensor_f32(
         ));
     }
 
-    Tensor::from_f32_vec(
-        Shape::from_slice(&[num_kv_heads, head_dim])?,
-        tensor.as_f32_slice()?.to_vec(),
-    )
+    tensor.reshape(Shape::from_slice(&[num_kv_heads, head_dim])?)
+}
+
+fn reshape_heads_2d_to_3d(
+    tensor: Tensor,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+) -> Result<Tensor> {
+    tensor.reshape(Shape::from_slice(&[seq_len, num_heads, head_dim])?)
+}
+
+fn reshape_heads_3d_to_2d(tensor: Tensor, seq_len: usize, hidden_size: usize) -> Result<Tensor> {
+    tensor.reshape(Shape::from_slice(&[seq_len, hidden_size])?)
 }
 
 fn linear_f32(input: &Tensor, weight: &Tensor, out: &mut Tensor) -> Result<()> {
@@ -725,11 +719,28 @@ fn linear_f32_with_bias(
 
     let bias_values = bias.as_f32_slice()?;
     let out_values = out.as_f32_slice_mut()?;
+    let thread_count = preferred_bias_add_thread_count(out_rows, out_cols);
 
-    for row in 0..out_rows {
-        for col in 0..out_cols {
-            out_values[row * out_cols + col] += bias_values[col];
+    if thread_count == 1 {
+        for row in 0..out_rows {
+            for col in 0..out_cols {
+                out_values[row * out_cols + col] += bias_values[col];
+            }
         }
+    } else {
+        let rows_per_chunk = out_rows.div_ceil(thread_count);
+        std::thread::scope(|scope| {
+            for chunk in out_values.chunks_mut(rows_per_chunk * out_cols) {
+                let bias_values = &bias_values;
+                scope.spawn(move || {
+                    for row in chunk.chunks_mut(out_cols) {
+                        for (slot, bias_value) in row.iter_mut().zip(bias_values.iter().copied()) {
+                            *slot += bias_value;
+                        }
+                    }
+                });
+            }
+        });
     }
 
     Ok(())
@@ -767,69 +778,48 @@ fn linear_right_transposed_f32(input: &Tensor, weight: &Tensor, out: &mut Tensor
 
     let input_values = input.as_f32_slice()?;
     let weight_values = weight.as_f32_slice()?;
-    let mut out_values = vec![0.0f32; out.element_count()];
-    let thread_count = preferred_transposed_linear_thread_count(rows, out_width, input_width);
+    let out_values = out.as_f32_slice_mut()?;
+    let thread_count = preferred_transposed_linear_row_thread_count(rows, out_width, input_width);
 
     if thread_count == 1 {
-        compute_linear_right_transposed_chunk(
+        compute_linear_right_transposed_row_chunk(
             &input_values,
             &weight_values,
-            &mut out_values,
-            rows,
+            out_values,
             input_width,
             out_width,
             0,
-            out_width,
+            rows,
         );
     } else {
-        let cols_per_chunk = out_width.div_ceil(thread_count);
+        let rows_per_chunk = rows.div_ceil(thread_count);
 
         std::thread::scope(|scope| {
-            let mut handles = Vec::new();
-            for chunk_index in 0..thread_count {
-                let col_start = chunk_index * cols_per_chunk;
-                if col_start >= out_width {
-                    break;
-                }
-
-                let col_end = (col_start + cols_per_chunk).min(out_width);
+            for (chunk_index, out_chunk) in out_values
+                .chunks_mut(rows_per_chunk * out_width)
+                .enumerate()
+            {
+                let row_start = chunk_index * rows_per_chunk;
+                let row_end = (row_start + rows_per_chunk).min(rows);
                 let input_values = &input_values;
                 let weight_values = &weight_values;
 
-                handles.push(scope.spawn(move || {
-                    let mut chunk_values = vec![0.0f32; rows * (col_end - col_start)];
-                    compute_linear_right_transposed_chunk(
+                scope.spawn(move || {
+                    compute_linear_right_transposed_row_chunk(
                         input_values,
                         weight_values,
-                        &mut chunk_values,
-                        rows,
+                        out_chunk,
                         input_width,
-                        col_end - col_start,
-                        col_start,
-                        col_end,
+                        out_width,
+                        row_start,
+                        row_end,
                     );
-                    (col_start, col_end, chunk_values)
-                }));
-            }
-
-            for handle in handles {
-                let (col_start, col_end, chunk_values) =
-                    handle.join().expect("scoped thread panicked");
-                let chunk_width = col_end - col_start;
-
-                for row in 0..rows {
-                    let dst_start = row * out_width + col_start;
-                    let dst_end = dst_start + chunk_width;
-                    let src_start = row * chunk_width;
-                    let src_end = src_start + chunk_width;
-                    out_values[dst_start..dst_end]
-                        .copy_from_slice(&chunk_values[src_start..src_end]);
-                }
+                });
             }
         });
     }
 
-    out.copy_from_f32_slice(&out_values)
+    Ok(())
 }
 
 fn linear_right_transposed_argmax_f32(input: &Tensor, weight: &Tensor) -> Result<TokenSample> {
@@ -987,26 +977,62 @@ fn merge_argmax_projection_chunks(
     }
 }
 
-fn compute_linear_right_transposed_chunk(
+fn compute_linear_right_transposed_row_chunk(
     input_values: &[f32],
     weight_values: &[f32],
-    out_values: &mut [f32],
-    rows: usize,
+    out_chunk: &mut [f32],
     input_width: usize,
     out_width: usize,
-    col_start: usize,
-    col_end: usize,
+    row_start: usize,
+    row_end: usize,
 ) {
-    for row in 0..rows {
-        for (local_col, out_col) in (col_start..col_end).enumerate() {
+    for (local_row, row) in (row_start..row_end).enumerate() {
+        let input_row = &input_values[row * input_width..(row + 1) * input_width];
+        let out_row = &mut out_chunk[local_row * out_width..(local_row + 1) * out_width];
+
+        for out_col in 0..out_width {
             let mut sum = 0.0f32;
-            for inner in 0..input_width {
-                sum += input_values[row * input_width + inner]
-                    * weight_values[out_col * input_width + inner];
+            let weight_row = &weight_values[out_col * input_width..(out_col + 1) * input_width];
+            for (input_value, weight_value) in input_row.iter().zip(weight_row.iter()) {
+                sum += input_value * weight_value;
             }
-            out_values[row * out_width + local_col] = sum;
+            out_row[out_col] = sum;
         }
     }
+}
+
+fn preferred_transposed_linear_row_thread_count(
+    rows: usize,
+    out_width: usize,
+    input_width: usize,
+) -> usize {
+    const MIN_PARALLEL_WORK: usize = 131_072;
+
+    if rows < 2 {
+        return 1;
+    }
+
+    let total_work = rows.saturating_mul(out_width).saturating_mul(input_width);
+    if total_work < MIN_PARALLEL_WORK {
+        return 1;
+    }
+
+    std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get().min(rows))
+        .unwrap_or(1)
+}
+
+fn preferred_bias_add_thread_count(rows: usize, cols: usize) -> usize {
+    const MIN_PARALLEL_WORK: usize = 131_072;
+
+    let total_work = rows.saturating_mul(cols);
+    if rows < 2 || total_work < MIN_PARALLEL_WORK {
+        return 1;
+    }
+
+    std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get().min(rows))
+        .unwrap_or(1)
 }
 
 fn preferred_transposed_linear_thread_count(

@@ -24,18 +24,49 @@ pub fn rms_norm_f32(input: &Tensor, weight: &Tensor, out: &mut Tensor, eps: f32)
     let input_values = input.as_f32_slice()?;
     let weight_values = weight.as_f32_slice()?;
     let out_values = out.as_f32_slice_mut()?;
+    let thread_count = preferred_rowwise_thread_count(rows, hidden);
 
-    for row in 0..rows {
-        let start = row * hidden;
-        let end = start + hidden;
-        let row_slice = &input_values[start..end];
+    if thread_count == 1 {
+        for row in 0..rows {
+            let start = row * hidden;
+            let end = start + hidden;
+            let row_slice = &input_values[start..end];
 
-        let mean_square = row_slice.iter().map(|value| value * value).sum::<f32>() / hidden as f32;
-        let inv_rms = 1.0 / (mean_square + eps).sqrt();
+            let mean_square =
+                row_slice.iter().map(|value| value * value).sum::<f32>() / hidden as f32;
+            let inv_rms = 1.0 / (mean_square + eps).sqrt();
 
-        for col in 0..hidden {
-            out_values[start + col] = row_slice[col] * inv_rms * weight_values[col];
+            for col in 0..hidden {
+                out_values[start + col] = row_slice[col] * inv_rms * weight_values[col];
+            }
         }
+    } else {
+        let rows_per_chunk = rows.div_ceil(thread_count);
+        std::thread::scope(|scope| {
+            for (chunk_index, out_chunk) in
+                out_values.chunks_mut(rows_per_chunk * hidden).enumerate()
+            {
+                let row_start = chunk_index * rows_per_chunk;
+                let row_end = (row_start + rows_per_chunk).min(rows);
+                let input_chunk = &input_values[row_start * hidden..row_end * hidden];
+                let weight_values = &weight_values;
+                scope.spawn(move || {
+                    for local_row in 0..(row_end - row_start) {
+                        let start = local_row * hidden;
+                        let end = start + hidden;
+                        let row_slice = &input_chunk[start..end];
+
+                        let mean_square = row_slice.iter().map(|value| value * value).sum::<f32>()
+                            / hidden as f32;
+                        let inv_rms = 1.0 / (mean_square + eps).sqrt();
+
+                        for col in 0..hidden {
+                            out_chunk[start + col] = row_slice[col] * inv_rms * weight_values[col];
+                        }
+                    }
+                });
+            }
+        });
     }
 
     Ok(())
@@ -54,26 +85,72 @@ pub fn softmax_f32(input: &Tensor, out: &mut Tensor) -> Result<()> {
     let rows = input.element_count() / width;
     let input_values = input.as_f32_slice()?;
     let out_values = out.as_f32_slice_mut()?;
+    let thread_count = preferred_rowwise_thread_count(rows, width);
 
-    for row in 0..rows {
-        let start = row * width;
-        let end = start + width;
-        let row_slice = &input_values[start..end];
-        let row_max = row_slice.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    if thread_count == 1 {
+        for row in 0..rows {
+            let start = row * width;
+            let end = start + width;
+            let row_slice = &input_values[start..end];
+            let row_max = row_slice.iter().copied().fold(f32::NEG_INFINITY, f32::max);
 
-        let mut sum = 0.0f32;
-        for col in 0..width {
-            let value = (row_slice[col] - row_max).exp();
-            out_values[start + col] = value;
-            sum += value;
+            let mut sum = 0.0f32;
+            for col in 0..width {
+                let value = (row_slice[col] - row_max).exp();
+                out_values[start + col] = value;
+                sum += value;
+            }
+
+            for col in 0..width {
+                out_values[start + col] /= sum;
+            }
         }
+    } else {
+        let rows_per_chunk = rows.div_ceil(thread_count);
+        std::thread::scope(|scope| {
+            for (chunk_index, out_chunk) in
+                out_values.chunks_mut(rows_per_chunk * width).enumerate()
+            {
+                let row_start = chunk_index * rows_per_chunk;
+                let row_end = (row_start + rows_per_chunk).min(rows);
+                let input_chunk = &input_values[row_start * width..row_end * width];
+                scope.spawn(move || {
+                    for local_row in 0..(row_end - row_start) {
+                        let start = local_row * width;
+                        let end = start + width;
+                        let row_slice = &input_chunk[start..end];
+                        let row_max = row_slice.iter().copied().fold(f32::NEG_INFINITY, f32::max);
 
-        for col in 0..width {
-            out_values[start + col] /= sum;
-        }
+                        let mut sum = 0.0f32;
+                        for col in 0..width {
+                            let value = (row_slice[col] - row_max).exp();
+                            out_chunk[start + col] = value;
+                            sum += value;
+                        }
+
+                        for col in 0..width {
+                            out_chunk[start + col] /= sum;
+                        }
+                    }
+                });
+            }
+        });
     }
 
     Ok(())
+}
+
+fn preferred_rowwise_thread_count(rows: usize, width: usize) -> usize {
+    const MIN_PARALLEL_WORK: usize = 131_072;
+
+    let total_work = rows.saturating_mul(width);
+    if rows < 2 || total_work < MIN_PARALLEL_WORK {
+        return 1;
+    }
+
+    std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get().min(rows))
+        .unwrap_or(1)
 }
 
 fn validate_rowwise_f32(input: &Tensor, out: &Tensor) -> Result<()> {

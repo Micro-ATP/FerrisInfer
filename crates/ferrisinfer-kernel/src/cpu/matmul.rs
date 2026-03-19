@@ -40,11 +40,12 @@ pub fn matmul_f32(lhs: &Tensor, rhs: &Tensor, out: &mut Tensor) -> Result<()> {
 
     let lhs_values = lhs.as_f32_slice()?;
     let rhs_values = rhs.as_f32_slice()?;
-    let mut out_values = vec![0.0f32; m * n];
+    let out_values = out.as_f32_slice_mut()?;
+    out_values.fill(0.0);
     let thread_count = preferred_thread_count(m, n, k);
 
     if thread_count == 1 {
-        compute_row_chunk(&lhs_values, &rhs_values, &mut out_values, 0, m, k, n);
+        compute_row_chunk(&lhs_values, &rhs_values, out_values, 0, m, k, n);
     } else {
         let rows_per_chunk = m.div_ceil(thread_count);
         std::thread::scope(|scope| {
@@ -60,8 +61,7 @@ pub fn matmul_f32(lhs: &Tensor, rhs: &Tensor, out: &mut Tensor) -> Result<()> {
             }
         });
     }
-
-    out.copy_from_f32_slice(&out_values)
+    Ok(())
 }
 
 fn compute_row_chunk(

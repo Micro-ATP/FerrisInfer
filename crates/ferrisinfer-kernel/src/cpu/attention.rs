@@ -27,21 +27,72 @@ pub fn embedding_gather_f32(embedding: &Tensor, token_ids: &[u32], out: &mut Ten
 
     let embedding_values = embedding.as_f32_slice()?;
     let out_values = out.as_f32_slice_mut()?;
+    let thread_count = preferred_embedding_thread_count(token_ids.len(), hidden_size);
 
-    for (row, token_id) in token_ids.iter().copied().enumerate() {
-        let token_index = token_id as usize;
-        if token_index >= vocab_size {
-            return Err(FerrisError::new(
-                ErrorKind::InvalidShape,
-                format!("token id {token_index} is out of vocabulary range {vocab_size}"),
-            ));
+    if thread_count == 1 {
+        for (row, token_id) in token_ids.iter().copied().enumerate() {
+            let token_index = token_id as usize;
+            if token_index >= vocab_size {
+                return Err(FerrisError::new(
+                    ErrorKind::InvalidShape,
+                    format!("token id {token_index} is out of vocabulary range {vocab_size}"),
+                ));
+            }
+
+            let src_start = token_index * hidden_size;
+            let src_end = src_start + hidden_size;
+            let dst_start = row * hidden_size;
+            let dst_end = dst_start + hidden_size;
+            out_values[dst_start..dst_end].copy_from_slice(&embedding_values[src_start..src_end]);
         }
+    } else {
+        let rows_per_chunk = token_ids.len().div_ceil(thread_count);
+        let error_slot = std::sync::Mutex::new(None);
 
-        let src_start = token_index * hidden_size;
-        let src_end = src_start + hidden_size;
-        let dst_start = row * hidden_size;
-        let dst_end = dst_start + hidden_size;
-        out_values[dst_start..dst_end].copy_from_slice(&embedding_values[src_start..src_end]);
+        std::thread::scope(|scope| {
+            for (chunk_index, out_chunk) in out_values
+                .chunks_mut(rows_per_chunk * hidden_size)
+                .enumerate()
+            {
+                let row_start = chunk_index * rows_per_chunk;
+                let row_end = row_start + out_chunk.len() / hidden_size;
+                let token_chunk = &token_ids[row_start..row_end];
+                let embedding_values = &embedding_values;
+                let error_slot = &error_slot;
+
+                scope.spawn(move || {
+                    for (local_row, token_id) in token_chunk.iter().copied().enumerate() {
+                        let token_index = token_id as usize;
+                        if token_index >= vocab_size {
+                            let mut error = error_slot.lock().expect("embedding gather mutex poisoned");
+                            if error.is_none() {
+                                *error = Some(FerrisError::new(
+                                    ErrorKind::InvalidShape,
+                                    format!(
+                                        "token id {token_index} is out of vocabulary range {vocab_size}"
+                                    ),
+                                ));
+                            }
+                            return;
+                        }
+
+                        let src_start = token_index * hidden_size;
+                        let src_end = src_start + hidden_size;
+                        let dst_start = local_row * hidden_size;
+                        let dst_end = dst_start + hidden_size;
+                        out_chunk[dst_start..dst_end]
+                            .copy_from_slice(&embedding_values[src_start..src_end]);
+                    }
+                });
+            }
+        });
+
+        if let Some(error) = error_slot
+            .into_inner()
+            .expect("embedding gather mutex poisoned")
+        {
+            return Err(error);
+        }
     }
 
     Ok(())
@@ -123,10 +174,13 @@ pub fn rope_f32(
 
     let query_dims = query.shape().dims();
     let key_dims = key.shape().dims();
-    let seq_len = query_dims[0];
+    let query_len = query_dims[0];
+    let query_heads = query_dims[1];
+    let key_len = key_dims[0];
+    let key_heads = key_dims[1];
     let head_dim = query_dims[2];
 
-    if key_dims[0] != seq_len || key_dims[2] != head_dim {
+    if key_len != query_len || key_dims[2] != head_dim {
         return Err(FerrisError::new(
             ErrorKind::InvalidShape,
             "query and key tensors must share sequence length and head dimension for RoPE",
@@ -151,29 +205,18 @@ pub fn rope_f32(
         ));
     }
 
-    let mut query_values = query.as_f32_slice()?.to_vec();
-    let mut key_values = key.as_f32_slice()?.to_vec();
-    apply_rope_in_place(
-        &mut query_values,
-        query_dims[0],
-        query_dims[1],
+    apply_rope_pair_in_place(
+        query.as_f32_slice_mut()?,
+        key.as_f32_slice_mut()?,
+        query_len,
+        query_heads,
+        key_heads,
         head_dim,
         position_offset,
         rotary_dims,
         theta,
     );
-    apply_rope_in_place(
-        &mut key_values,
-        key_dims[0],
-        key_dims[1],
-        head_dim,
-        position_offset,
-        rotary_dims,
-        theta,
-    );
-
-    query.copy_from_f32_slice(&query_values)?;
-    key.copy_from_f32_slice(&key_values)
+    Ok(())
 }
 
 pub fn prefixed_causal_attention_f32(
@@ -233,7 +276,7 @@ pub fn prefixed_causal_attention_f32(
     let query_values = query.as_f32_slice()?;
     let key_values = key.as_f32_slice()?;
     let value_values = value.as_f32_slice()?;
-    let mut out_values = vec![0.0f32; out.element_count()];
+    let out_values = out.as_f32_slice_mut()?;
 
     let thread_count =
         preferred_attention_thread_count(query_len, num_query_heads, head_dim, expected_kv_len);
@@ -242,7 +285,7 @@ pub fn prefixed_causal_attention_f32(
             &query_values,
             &key_values,
             &value_values,
-            &mut out_values,
+            out_values,
             0,
             query_len,
             cache_len,
@@ -283,8 +326,7 @@ pub fn prefixed_causal_attention_f32(
             }
         });
     }
-
-    out.copy_from_f32_slice(&out_values)
+    Ok(())
 }
 
 pub fn decode_causal_attention_f32(
@@ -356,7 +398,7 @@ pub fn decode_causal_attention_f32(
     let cached_value_bytes = cached_value.as_bytes();
     let queries_per_kv_head = num_query_heads / num_kv_heads;
     let scale = 1.0 / (head_dim as f32).sqrt();
-    let mut out_values = vec![0.0f32; out.element_count()];
+    let out_values = out.as_f32_slice_mut()?;
 
     let thread_count =
         preferred_decode_attention_thread_count(num_query_heads, head_dim, cache_len + 1);
@@ -367,7 +409,7 @@ pub fn decode_causal_attention_f32(
             cached_value_bytes,
             &key_slot_values,
             &value_slot_values,
-            &mut out_values,
+            out_values,
             0,
             num_query_heads,
             cache_len,
@@ -408,8 +450,7 @@ pub fn decode_causal_attention_f32(
             }
         });
     }
-
-    out.copy_from_f32_slice(&out_values)
+    Ok(())
 }
 
 pub fn causal_self_attention_f32(
@@ -472,41 +513,36 @@ fn compute_attention_chunk(
 
         for query_head in 0..num_query_heads {
             let kv_head = query_head / queries_per_kv_head;
-            let mut scores = Vec::with_capacity(max_attended_position + 1);
+            let query_base =
+                attention_index(query_position, query_head, 0, num_query_heads, head_dim);
+            let query_row = &query_values[query_base..query_base + head_dim];
+            let out_base =
+                attention_index(local_position, query_head, 0, num_query_heads, head_dim);
+            let out_row = &mut out_chunk[out_base..out_base + head_dim];
+            out_row.fill(0.0);
             let mut max_score = f32::NEG_INFINITY;
-
-            for attended_position in 0..=max_attended_position {
-                let mut score = 0.0f32;
-                for dim in 0..head_dim {
-                    let query_index =
-                        attention_index(query_position, query_head, dim, num_query_heads, head_dim);
-                    let key_index =
-                        attention_index(attended_position, kv_head, dim, num_kv_heads, head_dim);
-                    score += query_values[query_index] * key_values[key_index];
-                }
-                score *= scale;
-                max_score = max_score.max(score);
-                scores.push(score);
-            }
-
             let mut score_sum = 0.0f32;
-            for score in &mut scores {
-                *score = (*score - max_score).exp();
-                score_sum += *score;
+            for attended_position in 0..=max_attended_position {
+                let key_base =
+                    attention_index(attended_position, kv_head, 0, num_kv_heads, head_dim);
+                let key_row = &key_values[key_base..key_base + head_dim];
+                let score = dot_product(query_row, key_row) * scale;
+                let weight = update_online_softmax_accumulator(
+                    out_row,
+                    &mut max_score,
+                    &mut score_sum,
+                    score,
+                );
+
+                let value_base =
+                    attention_index(attended_position, kv_head, 0, num_kv_heads, head_dim);
+                let value_row = &value_values[value_base..value_base + head_dim];
+                accumulate_weighted_values(out_row, value_row, weight);
             }
 
-            for dim in 0..head_dim {
-                let out_index =
-                    attention_index(local_position, query_head, dim, num_query_heads, head_dim);
-                let mut weighted_sum = 0.0f32;
-
-                for (attended_position, normalized_score) in scores.iter().copied().enumerate() {
-                    let value_index =
-                        attention_index(attended_position, kv_head, dim, num_kv_heads, head_dim);
-                    weighted_sum += (normalized_score / score_sum) * value_values[value_index];
-                }
-
-                out_chunk[out_index] = weighted_sum;
+            let inv_score_sum = 1.0 / score_sum;
+            for value in out_row.iter_mut() {
+                *value *= inv_score_sum;
             }
         }
     }
@@ -528,58 +564,120 @@ fn compute_decode_attention_head_chunk(
     head_dim: usize,
     scale: f32,
 ) {
-    let attended_len = cache_len + 1;
-
     for (local_head_index, query_head) in (head_start..head_end).enumerate() {
         let kv_head = query_head / queries_per_kv_head;
         let query_base = query_head * head_dim;
         let slot_base = kv_head * head_dim;
-        let mut scores = Vec::with_capacity(attended_len);
+        let query_row = &query_values[query_base..query_base + head_dim];
+        let out_base = local_head_index * head_dim;
+        let out_row = &mut out_chunk[out_base..out_base + head_dim];
+        out_row.fill(0.0);
         let mut max_score = f32::NEG_INFINITY;
+        let mut score_sum = 0.0f32;
 
         for attended_position in 0..cache_len {
-            let mut score = 0.0f32;
-            for dim in 0..head_dim {
-                let key_index =
-                    attention_index(attended_position, kv_head, dim, num_kv_heads, head_dim);
-                score +=
-                    query_values[query_base + dim] * read_packed_f32(cached_key_bytes, key_index);
-            }
-            score *= scale;
-            max_score = max_score.max(score);
-            scores.push(score);
+            let score = dot_product_with_packed_values(
+                query_row,
+                cached_key_bytes,
+                attended_position,
+                kv_head,
+                num_kv_heads,
+                head_dim,
+            ) * scale;
+            let weight =
+                update_online_softmax_accumulator(out_row, &mut max_score, &mut score_sum, score);
+            accumulate_weighted_packed_values(
+                out_row,
+                cached_value_bytes,
+                attended_position,
+                kv_head,
+                num_kv_heads,
+                head_dim,
+                weight,
+            );
         }
 
-        let mut slot_score = 0.0f32;
-        for dim in 0..head_dim {
-            slot_score += query_values[query_base + dim] * key_slot_values[slot_base + dim];
+        let slot_row = &key_slot_values[slot_base..slot_base + head_dim];
+        let slot_score = dot_product(query_row, slot_row) * scale;
+        let slot_weight =
+            update_online_softmax_accumulator(out_row, &mut max_score, &mut score_sum, slot_score);
+        let slot_value_row = &value_slot_values[slot_base..slot_base + head_dim];
+        accumulate_weighted_values(out_row, slot_value_row, slot_weight);
+
+        let inv_score_sum = 1.0 / score_sum;
+        for value in out_row.iter_mut() {
+            *value *= inv_score_sum;
         }
-        slot_score *= scale;
-        max_score = max_score.max(slot_score);
-        scores.push(slot_score);
+    }
+}
 
-        let mut score_sum = 0.0f32;
-        for score in &mut scores {
-            *score = (*score - max_score).exp();
-            score_sum += *score;
+fn dot_product(lhs: &[f32], rhs: &[f32]) -> f32 {
+    lhs.iter()
+        .zip(rhs.iter())
+        .map(|(left, right)| left * right)
+        .sum()
+}
+
+fn dot_product_with_packed_values(
+    query_row: &[f32],
+    packed_values: &[u8],
+    position: usize,
+    head: usize,
+    num_heads: usize,
+    head_dim: usize,
+) -> f32 {
+    let mut sum = 0.0f32;
+    for (dim, query_value) in query_row.iter().copied().enumerate() {
+        let index = attention_index(position, head, dim, num_heads, head_dim);
+        sum += query_value * read_packed_f32(packed_values, index);
+    }
+    sum
+}
+
+fn update_online_softmax_accumulator(
+    out_row: &mut [f32],
+    max_score: &mut f32,
+    score_sum: &mut f32,
+    score: f32,
+) -> f32 {
+    if score > *max_score {
+        let rescale = if max_score.is_finite() {
+            (*max_score - score).exp()
+        } else {
+            0.0
+        };
+        for value in out_row.iter_mut() {
+            *value *= rescale;
         }
+        *score_sum *= rescale;
+        *max_score = score;
+        *score_sum += 1.0;
+        1.0
+    } else {
+        let weight = (score - *max_score).exp();
+        *score_sum += weight;
+        weight
+    }
+}
 
-        for dim in 0..head_dim {
-            let out_index = local_head_index * head_dim + dim;
-            let mut weighted_sum = 0.0f32;
+fn accumulate_weighted_values(out_row: &mut [f32], value_row: &[f32], weight: f32) {
+    for (out_value, value) in out_row.iter_mut().zip(value_row.iter().copied()) {
+        *out_value += weight * value;
+    }
+}
 
-            for (attended_position, normalized_score) in
-                scores[..cache_len].iter().copied().enumerate()
-            {
-                let value_index =
-                    attention_index(attended_position, kv_head, dim, num_kv_heads, head_dim);
-                weighted_sum += (normalized_score / score_sum)
-                    * read_packed_f32(cached_value_bytes, value_index);
-            }
-
-            weighted_sum += (scores[cache_len] / score_sum) * value_slot_values[slot_base + dim];
-            out_chunk[out_index] = weighted_sum;
-        }
+fn accumulate_weighted_packed_values(
+    out_row: &mut [f32],
+    packed_values: &[u8],
+    position: usize,
+    head: usize,
+    num_heads: usize,
+    head_dim: usize,
+    weight: f32,
+) {
+    for (dim, out_value) in out_row.iter_mut().enumerate() {
+        let index = attention_index(position, head, dim, num_heads, head_dim);
+        *out_value += weight * read_packed_f32(packed_values, index);
     }
 }
 
@@ -608,6 +706,19 @@ fn preferred_attention_thread_count(
         .unwrap_or(1)
 }
 
+fn preferred_embedding_thread_count(rows: usize, hidden_size: usize) -> usize {
+    const MIN_PARALLEL_WORK: usize = 131_072;
+
+    let total_work = rows.saturating_mul(hidden_size);
+    if rows < 2 || total_work < MIN_PARALLEL_WORK {
+        return 1;
+    }
+
+    std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get().min(rows))
+        .unwrap_or(1)
+}
+
 fn preferred_decode_attention_thread_count(
     num_query_heads: usize,
     head_dim: usize,
@@ -627,25 +738,39 @@ fn preferred_decode_attention_thread_count(
         .unwrap_or(1)
 }
 
-fn apply_rope_in_place(
-    values: &mut [f32],
+fn apply_rope_pair_in_place(
+    query_values: &mut [f32],
+    key_values: &mut [f32],
     seq_len: usize,
-    num_heads: usize,
+    query_heads: usize,
+    key_heads: usize,
     head_dim: usize,
     position_offset: usize,
     rotary_dims: usize,
     theta: f32,
 ) {
+    let inverse_frequencies = (0..rotary_dims)
+        .step_by(2)
+        .map(|dim| 1.0 / theta.powf(dim as f32 / head_dim as f32))
+        .collect::<Vec<_>>();
+
     for position in 0..seq_len {
         let absolute_position = (position_offset + position) as f32;
 
-        for head in 0..num_heads {
-            for dim in (0..rotary_dims).step_by(2) {
-                let angle = absolute_position / theta.powf(dim as f32 / head_dim as f32);
-                let cosine = angle.cos();
-                let sine = angle.sin();
-                let base = ((position * num_heads + head) * head_dim) + dim;
-                rotate_pair(values, base, cosine, sine);
+        for (pair_index, inverse_frequency) in inverse_frequencies.iter().copied().enumerate() {
+            let dim = pair_index * 2;
+            let angle = absolute_position * inverse_frequency;
+            let cosine = angle.cos();
+            let sine = angle.sin();
+
+            for head in 0..query_heads {
+                let base = ((position * query_heads + head) * head_dim) + dim;
+                rotate_pair(query_values, base, cosine, sine);
+            }
+
+            for head in 0..key_heads {
+                let base = ((position * key_heads + head) * head_dim) + dim;
+                rotate_pair(key_values, base, cosine, sine);
             }
         }
     }
