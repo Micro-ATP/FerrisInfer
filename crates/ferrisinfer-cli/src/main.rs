@@ -7,6 +7,9 @@ use ferrisinfer_io::{ChatMessage, HfSource, ModelSource, Tokenizer, VocabularyTo
 use ferrisinfer_kernel::{Backend, CpuBackend};
 use ferrisinfer_runtime::{ExecutionMode, GenerationRequest, InferenceEngine, SessionConfig};
 
+const DEFAULT_HF_PATH: &str = "models/Qwen2.5-0.5B-Instruct";
+const DEFAULT_SYSTEM_PROMPT_PATH: &str = "docs/system_prompt.md";
+
 fn main() {
     let engine = InferenceEngine::new(CpuBackend::default());
     let args: Vec<String> = env::args().collect();
@@ -21,6 +24,11 @@ fn main() {
         Some("tokenize-hf") => tokenize_hf(args.get(2).map(String::as_str)),
         Some("tokenize-file-hf") => tokenize_file_hf(args.get(2).map(String::as_str)),
         Some("smoke-hf") => smoke_hf(&engine, args.get(2).map(String::as_str)),
+        Some("generate-hf") => generate_hf(
+            &engine,
+            args.get(2).map(String::as_str),
+            args.get(3).map(String::as_str),
+        ),
         Some("help") | None => {
             print_help();
             Ok(())
@@ -53,6 +61,9 @@ fn print_help() {
         "  tokenize-file-hf [file]        Tokenize a text file with the default local HF tokenizer"
     );
     println!("  smoke-hf [text]                Run a reference next-token smoke test on the local HF model");
+    println!(
+        "  generate-hf [text] [tokens]    Run reference generation with docs/system_prompt.md"
+    );
 }
 
 fn print_plan(engine: &InferenceEngine<CpuBackend>, config: &SessionConfig) {
@@ -160,14 +171,14 @@ fn inspect_hf(path: Option<&str>) -> Result<(), ()> {
 
 fn render_chat_hf(text: Option<&str>) -> Result<(), ()> {
     let tokenizer = load_default_hf_tokenizer()?;
-    let user_text = text.unwrap_or("请你用一句话说明 FerrisInfer 当前最重要的工程目标。");
-    let rendered = tokenizer
-        .render_chat(&[ChatMessage::user(user_text)], true)
-        .map_err(|error| {
-            eprintln!("failed to render chat prompt: {}", error);
-        })?;
+    let user_text = text.unwrap_or("请你用一句话概括这份 system prompt 的核心约束。");
+    let system_prompt = load_default_system_prompt()?;
+    let rendered = render_default_chat_prompt(&tokenizer, user_text, &system_prompt)?;
 
     println!("FerrisInfer rendered chat prompt");
+    println!("model path: {}", default_hf_path());
+    println!("system prompt path: {}", default_system_prompt_path());
+    println!("system prompt chars: {}", system_prompt.chars().count());
     println!("chars: {}", rendered.chars().count());
     println!("bytes: {}", rendered.len());
     println!("preview: {}", preview_text(&rendered, 240));
@@ -189,7 +200,7 @@ fn tokenize_hf(text: Option<&str>) -> Result<(), ()> {
 }
 
 fn tokenize_file_hf(path: Option<&str>) -> Result<(), ()> {
-    let file_path = path.unwrap_or("docs/参考提示词.md");
+    let file_path = path.unwrap_or(default_system_prompt_path());
     let text = fs::read_to_string(file_path).map_err(|error| {
         eprintln!("failed to read text file '{}': {}", file_path, error);
     })?;
@@ -207,6 +218,86 @@ fn tokenize_file_hf(path: Option<&str>) -> Result<(), ()> {
 
 fn smoke_hf(engine: &InferenceEngine<CpuBackend>, text: Option<&str>) -> Result<(), ()> {
     let user_text = text.unwrap_or("请只回复一个词：OK");
+    let report = run_reference_generation(engine, user_text, 1)?;
+
+    println!("FerrisInfer reference smoke test");
+    println!("model path: {}", default_hf_path());
+    println!("system prompt path: {}", default_system_prompt_path());
+    println!("user text: {}", preview_text(user_text, 120));
+    println!("rendered prompt chars: {}", report.rendered.chars().count());
+    println!("prompt tokens: {}", report.prompt_token_ids.len());
+    println!(
+        "prompt token ids (first 32): {}",
+        preview_token_ids(&report.prompt_token_ids, 32)
+    );
+    println!("model load elapsed: {:.3?}", report.load_elapsed);
+    println!("forward elapsed: {:.3?}", report.forward_elapsed);
+    println!(
+        "generation finish reason: {:?}",
+        report.output.finish_reason
+    );
+
+    let Some(sample) = report.output.generated_tokens.first().copied() else {
+        eprintln!("reference generation did not produce any token");
+        return Err(());
+    };
+
+    println!("predicted token id: {}", sample.token_id);
+    println!("predicted token probability: {:.6}", sample.probability);
+    println!(
+        "predicted token text: {}",
+        preview_text(&report.output.generated_text, 80)
+    );
+    Ok(())
+}
+
+fn generate_hf(
+    engine: &InferenceEngine<CpuBackend>,
+    text: Option<&str>,
+    max_new_tokens: Option<&str>,
+) -> Result<(), ()> {
+    let user_text = text.unwrap_or("请用一句话概括这份 system prompt 的核心限制。");
+    let max_new_tokens = parse_max_new_tokens(max_new_tokens, 4)?;
+    let report = run_reference_generation(engine, user_text, max_new_tokens)?;
+
+    println!("FerrisInfer reference generation");
+    println!("model path: {}", default_hf_path());
+    println!("system prompt path: {}", default_system_prompt_path());
+    println!("user text: {}", preview_text(user_text, 120));
+    println!("requested max new tokens: {}", max_new_tokens);
+    println!("rendered prompt chars: {}", report.rendered.chars().count());
+    println!("prompt tokens: {}", report.prompt_token_ids.len());
+    println!("generated tokens: {}", report.output.generated_tokens.len());
+    println!("model load elapsed: {:.3?}", report.load_elapsed);
+    println!("forward elapsed: {:.3?}", report.forward_elapsed);
+    println!(
+        "generation finish reason: {:?}",
+        report.output.finish_reason
+    );
+    println!(
+        "generated token ids (first 32): {}",
+        preview_token_ids(&report.output.generated_token_ids(), 32)
+    );
+    println!(
+        "generated text: {}",
+        preview_text(&report.output.generated_text, 240)
+    );
+    Ok(())
+}
+
+struct ReferenceGenerationReport {
+    rendered: String,
+    prompt_token_ids: Vec<u32>,
+    output: ferrisinfer_runtime::GenerationOutput,
+    load_elapsed: std::time::Duration,
+    forward_elapsed: std::time::Duration,
+}
+
+fn run_reference_generation(
+    engine: &InferenceEngine<CpuBackend>,
+    user_text: &str,
+    max_new_tokens: usize,
+) -> Result<ReferenceGenerationReport, ()> {
     let mut source = HfSource::new(default_hf_path());
     let tokenizer_asset = source.load_tokenizer().map_err(|error| {
         eprintln!(
@@ -216,26 +307,12 @@ fn smoke_hf(engine: &InferenceEngine<CpuBackend>, text: Option<&str>) -> Result<
         );
     })?;
     let tokenizer = VocabularyTokenizer::new(tokenizer_asset);
-
-    let rendered = tokenizer
-        .render_chat(&[ChatMessage::user(user_text)], true)
-        .map_err(|error| {
-            eprintln!("failed to render chat prompt: {}", error);
-        })?;
+    let system_prompt = load_default_system_prompt()?;
+    let rendered = render_default_chat_prompt(&tokenizer, user_text, &system_prompt)?;
     let token_ids = tokenizer.encode(&rendered, false).map_err(|error| {
         eprintln!("failed to tokenize rendered prompt: {}", error);
     })?;
     let stop_token_id = tokenizer.asset().eos_token_id;
-
-    println!("FerrisInfer reference smoke test");
-    println!("model path: {}", default_hf_path());
-    println!("user text: {}", preview_text(user_text, 120));
-    println!("rendered prompt chars: {}", rendered.chars().count());
-    println!("prompt tokens: {}", token_ids.len());
-    println!(
-        "prompt token ids (first 32): {}",
-        preview_token_ids(&token_ids, 32)
-    );
 
     let load_start = Instant::now();
     let artifacts = engine.load_from_source(&mut source).map_err(|error| {
@@ -251,8 +328,8 @@ fn smoke_hf(engine: &InferenceEngine<CpuBackend>, text: Option<&str>) -> Result<
         })?;
     let output = session
         .generate_reference(&GenerationRequest {
-            prompt: rendered,
-            max_new_tokens: 1,
+            prompt: rendered.clone(),
+            max_new_tokens,
             add_bos: false,
             stop_token_id,
         })
@@ -261,25 +338,17 @@ fn smoke_hf(engine: &InferenceEngine<CpuBackend>, text: Option<&str>) -> Result<
         })?;
     let forward_elapsed = forward_start.elapsed();
 
-    let Some(sample) = output.generated_tokens.first().copied() else {
-        eprintln!("reference generation did not produce any token");
-        return Err(());
-    };
-
     if output.prompt_token_ids != token_ids {
         eprintln!("warning: session prompt tokenization diverged from CLI preview");
     }
 
-    println!("model load elapsed: {:.3?}", load_elapsed);
-    println!("forward elapsed: {:.3?}", forward_elapsed);
-    println!("generation finish reason: {:?}", output.finish_reason);
-    println!("predicted token id: {}", sample.token_id);
-    println!("predicted token probability: {:.6}", sample.probability);
-    println!(
-        "predicted token text: {}",
-        preview_text(&output.generated_text, 80)
-    );
-    Ok(())
+    Ok(ReferenceGenerationReport {
+        rendered,
+        prompt_token_ids: token_ids,
+        output,
+        load_elapsed,
+        forward_elapsed,
+    })
 }
 
 fn load_default_hf_tokenizer() -> Result<VocabularyTokenizer, ()> {
@@ -292,6 +361,59 @@ fn load_default_hf_tokenizer() -> Result<VocabularyTokenizer, ()> {
         );
     })?;
     Ok(VocabularyTokenizer::new(asset))
+}
+
+fn load_default_system_prompt() -> Result<String, ()> {
+    let text = fs::read_to_string(default_system_prompt_path()).map_err(|error| {
+        eprintln!(
+            "failed to read system prompt '{}': {}",
+            default_system_prompt_path(),
+            error
+        );
+    })?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        eprintln!(
+            "system prompt '{}' is empty after trimming whitespace",
+            default_system_prompt_path()
+        );
+        return Err(());
+    }
+    Ok(trimmed.to_string())
+}
+
+fn render_default_chat_prompt(
+    tokenizer: &VocabularyTokenizer,
+    user_text: &str,
+    system_prompt: &str,
+) -> Result<String, ()> {
+    tokenizer
+        .render_chat(
+            &[
+                ChatMessage::system(system_prompt),
+                ChatMessage::user(user_text),
+            ],
+            true,
+        )
+        .map_err(|error| {
+            eprintln!("failed to render chat prompt: {}", error);
+        })
+}
+
+fn parse_max_new_tokens(raw: Option<&str>, default: usize) -> Result<usize, ()> {
+    let Some(raw) = raw else {
+        return Ok(default);
+    };
+
+    let parsed = raw.parse::<usize>().map_err(|error| {
+        eprintln!("failed to parse max_new_tokens '{}': {}", raw, error);
+    })?;
+    if parsed == 0 {
+        eprintln!("max_new_tokens must be greater than zero");
+        return Err(());
+    }
+
+    Ok(parsed)
 }
 
 fn print_token_report(label: &str, original: &str, tokens: &[u32], decoded: &str) {
@@ -333,5 +455,9 @@ fn preview_token_ids(tokens: &[u32], max_items: usize) -> String {
 }
 
 fn default_hf_path() -> &'static str {
-    "models/Qwen2.5-0.5B-Instruct"
+    DEFAULT_HF_PATH
+}
+
+fn default_system_prompt_path() -> &'static str {
+    DEFAULT_SYSTEM_PROMPT_PATH
 }

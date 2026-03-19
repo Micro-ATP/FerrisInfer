@@ -235,48 +235,53 @@ pub fn prefixed_causal_attention_f32(
     let value_values = value.to_vec_f32()?;
     let mut out_values = vec![0.0f32; out.element_count()];
 
-    for query_position in 0..query_len {
-        let max_attended_position = cache_len + query_position;
+    let thread_count =
+        preferred_attention_thread_count(query_len, num_query_heads, head_dim, expected_kv_len);
+    if thread_count == 1 {
+        compute_attention_chunk(
+            &query_values,
+            &key_values,
+            &value_values,
+            &mut out_values,
+            0,
+            query_len,
+            cache_len,
+            num_query_heads,
+            num_kv_heads,
+            queries_per_kv_head,
+            head_dim,
+            scale,
+        );
+    } else {
+        let positions_per_chunk = query_len.div_ceil(thread_count);
+        let chunk_width = positions_per_chunk * num_query_heads * head_dim;
 
-        for query_head in 0..num_query_heads {
-            let kv_head = query_head / queries_per_kv_head;
-            let mut scores = Vec::with_capacity(max_attended_position + 1);
-            let mut max_score = f32::NEG_INFINITY;
+        std::thread::scope(|scope| {
+            for (chunk_index, out_chunk) in out_values.chunks_mut(chunk_width).enumerate() {
+                let position_start = chunk_index * positions_per_chunk;
+                let position_end = (position_start + positions_per_chunk).min(query_len);
+                let query_values = &query_values;
+                let key_values = &key_values;
+                let value_values = &value_values;
 
-            for attended_position in 0..=max_attended_position {
-                let mut score = 0.0f32;
-                for dim in 0..head_dim {
-                    let query_index =
-                        attention_index(query_position, query_head, dim, num_query_heads, head_dim);
-                    let key_index =
-                        attention_index(attended_position, kv_head, dim, num_kv_heads, head_dim);
-                    score += query_values[query_index] * key_values[key_index];
-                }
-                score *= scale;
-                max_score = max_score.max(score);
-                scores.push(score);
+                scope.spawn(move || {
+                    compute_attention_chunk(
+                        query_values,
+                        key_values,
+                        value_values,
+                        out_chunk,
+                        position_start,
+                        position_end,
+                        cache_len,
+                        num_query_heads,
+                        num_kv_heads,
+                        queries_per_kv_head,
+                        head_dim,
+                        scale,
+                    );
+                });
             }
-
-            let mut score_sum = 0.0f32;
-            for score in &mut scores {
-                *score = (*score - max_score).exp();
-                score_sum += *score;
-            }
-
-            for dim in 0..head_dim {
-                let out_index =
-                    attention_index(query_position, query_head, dim, num_query_heads, head_dim);
-                let mut weighted_sum = 0.0f32;
-
-                for (attended_position, normalized_score) in scores.iter().copied().enumerate() {
-                    let value_index =
-                        attention_index(attended_position, kv_head, dim, num_kv_heads, head_dim);
-                    weighted_sum += (normalized_score / score_sum) * value_values[value_index];
-                }
-
-                out_values[out_index] = weighted_sum;
-            }
-        }
+        });
     }
 
     out.copy_from_f32_slice(&out_values)
@@ -313,6 +318,91 @@ fn attention_index(
     head_dim: usize,
 ) -> usize {
     ((position * num_heads + head) * head_dim) + dim
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_attention_chunk(
+    query_values: &[f32],
+    key_values: &[f32],
+    value_values: &[f32],
+    out_chunk: &mut [f32],
+    position_start: usize,
+    position_end: usize,
+    cache_len: usize,
+    num_query_heads: usize,
+    num_kv_heads: usize,
+    queries_per_kv_head: usize,
+    head_dim: usize,
+    scale: f32,
+) {
+    for (local_position, query_position) in (position_start..position_end).enumerate() {
+        let max_attended_position = cache_len + query_position;
+
+        for query_head in 0..num_query_heads {
+            let kv_head = query_head / queries_per_kv_head;
+            let mut scores = Vec::with_capacity(max_attended_position + 1);
+            let mut max_score = f32::NEG_INFINITY;
+
+            for attended_position in 0..=max_attended_position {
+                let mut score = 0.0f32;
+                for dim in 0..head_dim {
+                    let query_index =
+                        attention_index(query_position, query_head, dim, num_query_heads, head_dim);
+                    let key_index =
+                        attention_index(attended_position, kv_head, dim, num_kv_heads, head_dim);
+                    score += query_values[query_index] * key_values[key_index];
+                }
+                score *= scale;
+                max_score = max_score.max(score);
+                scores.push(score);
+            }
+
+            let mut score_sum = 0.0f32;
+            for score in &mut scores {
+                *score = (*score - max_score).exp();
+                score_sum += *score;
+            }
+
+            for dim in 0..head_dim {
+                let out_index =
+                    attention_index(local_position, query_head, dim, num_query_heads, head_dim);
+                let mut weighted_sum = 0.0f32;
+
+                for (attended_position, normalized_score) in scores.iter().copied().enumerate() {
+                    let value_index =
+                        attention_index(attended_position, kv_head, dim, num_kv_heads, head_dim);
+                    weighted_sum += (normalized_score / score_sum) * value_values[value_index];
+                }
+
+                out_chunk[out_index] = weighted_sum;
+            }
+        }
+    }
+}
+
+fn preferred_attention_thread_count(
+    query_len: usize,
+    num_query_heads: usize,
+    head_dim: usize,
+    attended_len: usize,
+) -> usize {
+    const MIN_PARALLEL_WORK: usize = 131_072;
+
+    if query_len < 2 {
+        return 1;
+    }
+
+    let total_work = query_len
+        .saturating_mul(num_query_heads)
+        .saturating_mul(head_dim)
+        .saturating_mul(attended_len);
+    if total_work < MIN_PARALLEL_WORK {
+        return 1;
+    }
+
+    std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get().min(query_len))
+        .unwrap_or(1)
 }
 
 fn apply_rope_in_place(

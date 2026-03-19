@@ -41,20 +41,67 @@ pub fn matmul_f32(lhs: &Tensor, rhs: &Tensor, out: &mut Tensor) -> Result<()> {
     let lhs_values = lhs.to_vec_f32()?;
     let rhs_values = rhs.to_vec_f32()?;
     let mut out_values = vec![0.0f32; m * n];
+    let thread_count = preferred_thread_count(m, n, k);
 
-    for row in 0..m {
-        for col in 0..n {
-            let mut sum = 0.0f32;
-            for inner in 0..k {
-                let lhs_index = row * k + inner;
-                let rhs_index = inner * n + col;
-                sum += lhs_values[lhs_index] * rhs_values[rhs_index];
+    if thread_count == 1 {
+        compute_row_chunk(&lhs_values, &rhs_values, &mut out_values, 0, m, k, n);
+    } else {
+        let rows_per_chunk = m.div_ceil(thread_count);
+        std::thread::scope(|scope| {
+            for (chunk_index, out_chunk) in out_values.chunks_mut(rows_per_chunk * n).enumerate() {
+                let row_start = chunk_index * rows_per_chunk;
+                let row_end = (row_start + rows_per_chunk).min(m);
+                let lhs_values = &lhs_values;
+                let rhs_values = &rhs_values;
+
+                scope.spawn(move || {
+                    compute_row_chunk(lhs_values, rhs_values, out_chunk, row_start, row_end, k, n);
+                });
             }
-            out_values[row * n + col] = sum;
-        }
+        });
     }
 
     out.copy_from_f32_slice(&out_values)
+}
+
+fn compute_row_chunk(
+    lhs_values: &[f32],
+    rhs_values: &[f32],
+    out_chunk: &mut [f32],
+    row_start: usize,
+    row_end: usize,
+    k: usize,
+    n: usize,
+) {
+    for (local_row, row) in (row_start..row_end).enumerate() {
+        let lhs_row = &lhs_values[row * k..(row + 1) * k];
+        let out_row = &mut out_chunk[local_row * n..(local_row + 1) * n];
+
+        for (col, slot) in out_row.iter_mut().enumerate() {
+            let mut sum = 0.0f32;
+            for (inner, lhs_value) in lhs_row.iter().copied().enumerate() {
+                sum += lhs_value * rhs_values[inner * n + col];
+            }
+            *slot = sum;
+        }
+    }
+}
+
+fn preferred_thread_count(rows: usize, cols: usize, inner: usize) -> usize {
+    const MIN_PARALLEL_WORK: usize = 131_072;
+
+    if rows < 2 {
+        return 1;
+    }
+
+    let total_work = rows.saturating_mul(cols).saturating_mul(inner);
+    if total_work < MIN_PARALLEL_WORK {
+        return 1;
+    }
+
+    std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get().min(rows))
+        .unwrap_or(1)
 }
 
 #[cfg(test)]

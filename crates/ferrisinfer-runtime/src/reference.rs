@@ -432,19 +432,111 @@ fn linear_right_transposed_f32(input: &Tensor, weight: &Tensor, out: &mut Tensor
     let input_values = input.to_vec_f32()?;
     let weight_values = weight.to_vec_f32()?;
     let mut out_values = vec![0.0f32; out.element_count()];
+    let thread_count = preferred_transposed_linear_thread_count(rows, out_width, input_width);
 
+    if thread_count == 1 {
+        compute_linear_right_transposed_chunk(
+            &input_values,
+            &weight_values,
+            &mut out_values,
+            rows,
+            input_width,
+            out_width,
+            0,
+            out_width,
+        );
+    } else {
+        let cols_per_chunk = out_width.div_ceil(thread_count);
+
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for chunk_index in 0..thread_count {
+                let col_start = chunk_index * cols_per_chunk;
+                if col_start >= out_width {
+                    break;
+                }
+
+                let col_end = (col_start + cols_per_chunk).min(out_width);
+                let input_values = &input_values;
+                let weight_values = &weight_values;
+
+                handles.push(scope.spawn(move || {
+                    let mut chunk_values = vec![0.0f32; rows * (col_end - col_start)];
+                    compute_linear_right_transposed_chunk(
+                        input_values,
+                        weight_values,
+                        &mut chunk_values,
+                        rows,
+                        input_width,
+                        col_end - col_start,
+                        col_start,
+                        col_end,
+                    );
+                    (col_start, col_end, chunk_values)
+                }));
+            }
+
+            for handle in handles {
+                let (col_start, col_end, chunk_values) =
+                    handle.join().expect("scoped thread panicked");
+                let chunk_width = col_end - col_start;
+
+                for row in 0..rows {
+                    let dst_start = row * out_width + col_start;
+                    let dst_end = dst_start + chunk_width;
+                    let src_start = row * chunk_width;
+                    let src_end = src_start + chunk_width;
+                    out_values[dst_start..dst_end]
+                        .copy_from_slice(&chunk_values[src_start..src_end]);
+                }
+            }
+        });
+    }
+
+    out.copy_from_f32_slice(&out_values)
+}
+
+fn compute_linear_right_transposed_chunk(
+    input_values: &[f32],
+    weight_values: &[f32],
+    out_values: &mut [f32],
+    rows: usize,
+    input_width: usize,
+    out_width: usize,
+    col_start: usize,
+    col_end: usize,
+) {
     for row in 0..rows {
-        for out_col in 0..out_width {
+        for (local_col, out_col) in (col_start..col_end).enumerate() {
             let mut sum = 0.0f32;
             for inner in 0..input_width {
                 sum += input_values[row * input_width + inner]
                     * weight_values[out_col * input_width + inner];
             }
-            out_values[row * out_width + out_col] = sum;
+            out_values[row * out_width + local_col] = sum;
         }
     }
+}
 
-    out.copy_from_f32_slice(&out_values)
+fn preferred_transposed_linear_thread_count(
+    rows: usize,
+    out_width: usize,
+    input_width: usize,
+) -> usize {
+    const MIN_PARALLEL_WORK: usize = 131_072;
+
+    if out_width < 2 {
+        return 1;
+    }
+
+    let total_work = rows.saturating_mul(out_width).saturating_mul(input_width);
+    if total_work < MIN_PARALLEL_WORK {
+        return 1;
+    }
+
+    std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get().min(out_width))
+        .unwrap_or(1)
 }
 
 fn zeros_2d(rows: usize, cols: usize) -> Result<Tensor> {
