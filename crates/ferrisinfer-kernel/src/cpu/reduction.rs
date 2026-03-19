@@ -21,9 +21,9 @@ pub fn rms_norm_f32(input: &Tensor, weight: &Tensor, out: &mut Tensor, eps: f32)
     }
 
     let rows = input.element_count() / hidden;
-    let input_values = input.to_vec_f32()?;
-    let weight_values = weight.to_vec_f32()?;
-    let mut out_values = vec![0.0f32; input.element_count()];
+    let input_values = input.as_f32_slice()?;
+    let weight_values = weight.as_f32_slice()?;
+    let out_values = out.as_f32_slice_mut()?;
 
     for row in 0..rows {
         let start = row * hidden;
@@ -38,7 +38,7 @@ pub fn rms_norm_f32(input: &Tensor, weight: &Tensor, out: &mut Tensor, eps: f32)
         }
     }
 
-    out.copy_from_f32_slice(&out_values)
+    Ok(())
 }
 
 pub fn softmax_f32(input: &Tensor, out: &mut Tensor) -> Result<()> {
@@ -52,8 +52,8 @@ pub fn softmax_f32(input: &Tensor, out: &mut Tensor) -> Result<()> {
         )
     })?;
     let rows = input.element_count() / width;
-    let input_values = input.to_vec_f32()?;
-    let mut out_values = vec![0.0f32; input.element_count()];
+    let input_values = input.as_f32_slice()?;
+    let out_values = out.as_f32_slice_mut()?;
 
     for row in 0..rows {
         let start = row * width;
@@ -73,7 +73,7 @@ pub fn softmax_f32(input: &Tensor, out: &mut Tensor) -> Result<()> {
         }
     }
 
-    out.copy_from_f32_slice(&out_values)
+    Ok(())
 }
 
 fn validate_rowwise_f32(input: &Tensor, out: &Tensor) -> Result<()> {

@@ -25,8 +25,8 @@ pub fn embedding_gather_f32(embedding: &Tensor, token_ids: &[u32], out: &mut Ten
         ));
     }
 
-    let embedding_values = embedding.to_vec_f32()?;
-    let mut out_values = vec![0.0f32; out.element_count()];
+    let embedding_values = embedding.as_f32_slice()?;
+    let out_values = out.as_f32_slice_mut()?;
 
     for (row, token_id) in token_ids.iter().copied().enumerate() {
         let token_index = token_id as usize;
@@ -44,7 +44,7 @@ pub fn embedding_gather_f32(embedding: &Tensor, token_ids: &[u32], out: &mut Ten
         out_values[dst_start..dst_end].copy_from_slice(&embedding_values[src_start..src_end]);
     }
 
-    out.copy_from_f32_slice(&out_values)
+    Ok(())
 }
 
 pub fn split_heads_f32(input: &Tensor, num_heads: usize, out: &mut Tensor) -> Result<()> {
@@ -79,7 +79,7 @@ pub fn split_heads_f32(input: &Tensor, num_heads: usize, out: &mut Tensor) -> Re
         ));
     }
 
-    out.copy_from_f32_slice(&input.to_vec_f32()?)
+    out.copy_from_f32_slice(input.as_f32_slice()?)
 }
 
 pub fn merge_heads_f32(input: &Tensor, out: &mut Tensor) -> Result<()> {
@@ -108,7 +108,7 @@ pub fn merge_heads_f32(input: &Tensor, out: &mut Tensor) -> Result<()> {
         ));
     }
 
-    out.copy_from_f32_slice(&input.to_vec_f32()?)
+    out.copy_from_f32_slice(input.as_f32_slice()?)
 }
 
 pub fn rope_f32(
@@ -151,8 +151,8 @@ pub fn rope_f32(
         ));
     }
 
-    let mut query_values = query.to_vec_f32()?;
-    let mut key_values = key.to_vec_f32()?;
+    let mut query_values = query.as_f32_slice()?.to_vec();
+    let mut key_values = key.as_f32_slice()?.to_vec();
     apply_rope_in_place(
         &mut query_values,
         query_dims[0],
@@ -230,9 +230,9 @@ pub fn prefixed_causal_attention_f32(
     let queries_per_kv_head = num_query_heads / num_kv_heads;
     let scale = 1.0 / (head_dim as f32).sqrt();
 
-    let query_values = query.to_vec_f32()?;
-    let key_values = key.to_vec_f32()?;
-    let value_values = value.to_vec_f32()?;
+    let query_values = query.as_f32_slice()?;
+    let key_values = key.as_f32_slice()?;
+    let value_values = value.as_f32_slice()?;
     let mut out_values = vec![0.0f32; out.element_count()];
 
     let thread_count =
@@ -287,6 +287,131 @@ pub fn prefixed_causal_attention_f32(
     out.copy_from_f32_slice(&out_values)
 }
 
+pub fn decode_causal_attention_f32(
+    query: &Tensor,
+    cached_key: &Tensor,
+    cached_value: &Tensor,
+    cache_len: usize,
+    key_slot: &Tensor,
+    value_slot: &Tensor,
+    out: &mut Tensor,
+) -> Result<()> {
+    validate_attention_tensor(query)?;
+    validate_attention_tensor(cached_key)?;
+    validate_attention_tensor(cached_value)?;
+    out.ensure_dtype(DType::F32)?;
+    out.ensure_contiguous()?;
+    key_slot.ensure_dtype(DType::F32)?;
+    key_slot.ensure_contiguous()?;
+    value_slot.ensure_dtype(DType::F32)?;
+    value_slot.ensure_contiguous()?;
+
+    let query_dims = query.shape().dims();
+    let cache_key_dims = cached_key.shape().dims();
+    let cache_value_dims = cached_value.shape().dims();
+    let out_dims = out.shape().dims();
+    let num_query_heads = query_dims[1];
+    let head_dim = query_dims[2];
+    let num_kv_heads = cache_key_dims[1];
+
+    if query_dims[0] != 1 || out_dims != query_dims {
+        return Err(FerrisError::new(
+            ErrorKind::InvalidShape,
+            "decode attention requires query/output shape [1, num_heads, head_dim]",
+        ));
+    }
+
+    if cache_key_dims[0] < cache_len
+        || cache_value_dims[0] < cache_len
+        || cache_value_dims[1] != num_kv_heads
+        || cache_key_dims[2] != head_dim
+        || cache_value_dims[2] != head_dim
+    {
+        return Err(FerrisError::new(
+            ErrorKind::InvalidShape,
+            "decode attention cache tensors must cover cache_len and match head dimensions",
+        ));
+    }
+
+    if key_slot.shape().dims() != [num_kv_heads, head_dim]
+        || value_slot.shape().dims() != [num_kv_heads, head_dim]
+    {
+        return Err(FerrisError::new(
+            ErrorKind::InvalidShape,
+            "decode attention slot tensors must have shape [num_kv_heads, head_dim]",
+        ));
+    }
+
+    if num_query_heads % num_kv_heads != 0 {
+        return Err(FerrisError::new(
+            ErrorKind::InvalidShape,
+            "number of query heads must be divisible by number of KV heads",
+        ));
+    }
+
+    let query_values = query.as_f32_slice()?;
+    let key_slot_values = key_slot.as_f32_slice()?;
+    let value_slot_values = value_slot.as_f32_slice()?;
+    let cached_key_bytes = cached_key.as_bytes();
+    let cached_value_bytes = cached_value.as_bytes();
+    let queries_per_kv_head = num_query_heads / num_kv_heads;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let mut out_values = vec![0.0f32; out.element_count()];
+
+    let thread_count =
+        preferred_decode_attention_thread_count(num_query_heads, head_dim, cache_len + 1);
+    if thread_count == 1 {
+        compute_decode_attention_head_chunk(
+            &query_values,
+            cached_key_bytes,
+            cached_value_bytes,
+            &key_slot_values,
+            &value_slot_values,
+            &mut out_values,
+            0,
+            num_query_heads,
+            cache_len,
+            num_kv_heads,
+            queries_per_kv_head,
+            head_dim,
+            scale,
+        );
+    } else {
+        let heads_per_chunk = num_query_heads.div_ceil(thread_count);
+        let chunk_width = heads_per_chunk * head_dim;
+
+        std::thread::scope(|scope| {
+            for (chunk_index, out_chunk) in out_values.chunks_mut(chunk_width).enumerate() {
+                let head_start = chunk_index * heads_per_chunk;
+                let head_end = (head_start + heads_per_chunk).min(num_query_heads);
+                let query_values = &query_values;
+                let key_slot_values = &key_slot_values;
+                let value_slot_values = &value_slot_values;
+
+                scope.spawn(move || {
+                    compute_decode_attention_head_chunk(
+                        query_values,
+                        cached_key_bytes,
+                        cached_value_bytes,
+                        key_slot_values,
+                        value_slot_values,
+                        out_chunk,
+                        head_start,
+                        head_end,
+                        cache_len,
+                        num_kv_heads,
+                        queries_per_kv_head,
+                        head_dim,
+                        scale,
+                    );
+                });
+            }
+        });
+    }
+
+    out.copy_from_f32_slice(&out_values)
+}
+
 pub fn causal_self_attention_f32(
     query: &Tensor,
     key: &Tensor,
@@ -318,6 +443,13 @@ fn attention_index(
     head_dim: usize,
 ) -> usize {
     ((position * num_heads + head) * head_dim) + dim
+}
+
+fn read_packed_f32(bytes: &[u8], index: usize) -> f32 {
+    let start = index * DType::F32.size_in_bytes();
+    let mut array = [0u8; 4];
+    array.copy_from_slice(&bytes[start..start + 4]);
+    f32::from_le_bytes(array)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -380,6 +512,77 @@ fn compute_attention_chunk(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn compute_decode_attention_head_chunk(
+    query_values: &[f32],
+    cached_key_bytes: &[u8],
+    cached_value_bytes: &[u8],
+    key_slot_values: &[f32],
+    value_slot_values: &[f32],
+    out_chunk: &mut [f32],
+    head_start: usize,
+    head_end: usize,
+    cache_len: usize,
+    num_kv_heads: usize,
+    queries_per_kv_head: usize,
+    head_dim: usize,
+    scale: f32,
+) {
+    let attended_len = cache_len + 1;
+
+    for (local_head_index, query_head) in (head_start..head_end).enumerate() {
+        let kv_head = query_head / queries_per_kv_head;
+        let query_base = query_head * head_dim;
+        let slot_base = kv_head * head_dim;
+        let mut scores = Vec::with_capacity(attended_len);
+        let mut max_score = f32::NEG_INFINITY;
+
+        for attended_position in 0..cache_len {
+            let mut score = 0.0f32;
+            for dim in 0..head_dim {
+                let key_index =
+                    attention_index(attended_position, kv_head, dim, num_kv_heads, head_dim);
+                score += query_values[query_base + dim] * read_packed_f32(cached_key_bytes, key_index);
+            }
+            score *= scale;
+            max_score = max_score.max(score);
+            scores.push(score);
+        }
+
+        let mut slot_score = 0.0f32;
+        for dim in 0..head_dim {
+            slot_score += query_values[query_base + dim] * key_slot_values[slot_base + dim];
+        }
+        slot_score *= scale;
+        max_score = max_score.max(slot_score);
+        scores.push(slot_score);
+
+        let mut score_sum = 0.0f32;
+        for score in &mut scores {
+            *score = (*score - max_score).exp();
+            score_sum += *score;
+        }
+
+        for dim in 0..head_dim {
+            let out_index = local_head_index * head_dim + dim;
+            let mut weighted_sum = 0.0f32;
+
+            for (attended_position, normalized_score) in
+                scores[..cache_len].iter().copied().enumerate()
+            {
+                let value_index =
+                    attention_index(attended_position, kv_head, dim, num_kv_heads, head_dim);
+                weighted_sum +=
+                    (normalized_score / score_sum) * read_packed_f32(cached_value_bytes, value_index);
+            }
+
+            weighted_sum +=
+                (scores[cache_len] / score_sum) * value_slot_values[slot_base + dim];
+            out_chunk[out_index] = weighted_sum;
+        }
+    }
+}
+
 fn preferred_attention_thread_count(
     query_len: usize,
     num_query_heads: usize,
@@ -402,6 +605,25 @@ fn preferred_attention_thread_count(
 
     std::thread::available_parallelism()
         .map(|parallelism| parallelism.get().min(query_len))
+        .unwrap_or(1)
+}
+
+fn preferred_decode_attention_thread_count(
+    num_query_heads: usize,
+    head_dim: usize,
+    attended_len: usize,
+) -> usize {
+    const MIN_PARALLEL_WORK: usize = 32_768;
+
+    let total_work = num_query_heads
+        .saturating_mul(head_dim)
+        .saturating_mul(attended_len);
+    if total_work < MIN_PARALLEL_WORK || num_query_heads < 2 {
+        return 1;
+    }
+
+    std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get().min(num_query_heads))
         .unwrap_or(1)
 }
 
@@ -524,6 +746,53 @@ mod tests {
         prefixed_causal_attention_f32(&query, &key, &value, 1, &mut out).unwrap();
 
         approx_eq_slice(&out.to_vec_f32().unwrap(), &[0.33023846, 0.66976154], 1e-6);
+    }
+
+    #[test]
+    fn decode_causal_attention_f32_matches_prefixed_reference() {
+        let query = Tensor::from_f32_vec(
+            Shape::from_slice(&[1, 2, 2]).unwrap(),
+            vec![1.0, 0.0, 0.0, 1.0],
+        )
+        .unwrap();
+        let cache_key = Tensor::from_f32_vec(
+            Shape::from_slice(&[4, 1, 2]).unwrap(),
+            vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        )
+        .unwrap();
+        let cache_value = cache_key.clone();
+        let key_slot =
+            Tensor::from_f32_vec(Shape::from_slice(&[1, 2]).unwrap(), vec![0.0, 1.0]).unwrap();
+        let value_slot = key_slot.clone();
+        let full_key = Tensor::from_f32_vec(
+            Shape::from_slice(&[2, 1, 2]).unwrap(),
+            vec![1.0, 0.0, 0.0, 1.0],
+        )
+        .unwrap();
+        let full_value = full_key.clone();
+        let mut decode_out =
+            Tensor::zeros(DType::F32, Shape::from_slice(&[1, 2, 2]).unwrap()).unwrap();
+        let mut prefixed_out =
+            Tensor::zeros(DType::F32, Shape::from_slice(&[1, 2, 2]).unwrap()).unwrap();
+
+        decode_causal_attention_f32(
+            &query,
+            &cache_key,
+            &cache_value,
+            1,
+            &key_slot,
+            &value_slot,
+            &mut decode_out,
+        )
+        .unwrap();
+        prefixed_causal_attention_f32(&query, &full_key, &full_value, 1, &mut prefixed_out)
+            .unwrap();
+
+        approx_eq_slice(
+            &decode_out.to_vec_f32().unwrap(),
+            &prefixed_out.to_vec_f32().unwrap(),
+            1e-6,
+        );
     }
 
     #[test]

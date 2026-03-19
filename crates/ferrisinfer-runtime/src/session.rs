@@ -5,8 +5,11 @@ use ferrisinfer_io::Tokenizer;
 use ferrisinfer_model::DecoderOnlyModel;
 
 use crate::kv_cache::{KvCache, KvCacheConfig};
-use crate::reference::decoder_model_last_token_logits_f32;
-use crate::sampler::{argmax_last_token, SamplerConfig, TokenSample};
+use crate::reference::{
+    decoder_model_prefill_last_token_sample_with_kv_cache_f32,
+    decoder_model_token_sample_with_kv_cache_f32,
+};
+use crate::sampler::{SamplerConfig, TokenSample};
 
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
@@ -76,6 +79,7 @@ pub struct Session {
     kv_cache: KvCache,
     position: usize,
     token_history: Vec<u32>,
+    last_sample: Option<TokenSample>,
 }
 
 impl Session {
@@ -100,6 +104,7 @@ impl Session {
             kv_cache,
             position: 0,
             token_history: Vec::new(),
+            last_sample: None,
         })
     }
 
@@ -127,6 +132,7 @@ impl Session {
         self.kv_cache.reset();
         self.position = 0;
         self.token_history.clear();
+        self.last_sample = None;
     }
 
     pub fn prefill(&mut self, prompt: &str) -> Result<Vec<u32>> {
@@ -143,12 +149,21 @@ impl Session {
             ));
         }
 
-        self.kv_cache.advance(token_ids.len())?;
-        self.position = self
-            .position
-            .checked_add(token_ids.len())
-            .ok_or_else(|| FerrisError::new(ErrorKind::Runtime, "session position overflow"))?;
-        self.token_history.extend_from_slice(token_ids);
+        if self.position != self.kv_cache.used_tokens() {
+            return Err(FerrisError::new(
+                ErrorKind::Runtime,
+                "session position and KV cache usage diverged",
+            ));
+        }
+
+        if self.position == 0 && token_ids.len() > 1 {
+            self.process_reference_prefill_tokens(token_ids)?;
+            return Ok(());
+        }
+
+        for &token_id in token_ids {
+            self.process_reference_token(token_id)?;
+        }
         Ok(())
     }
 
@@ -160,16 +175,13 @@ impl Session {
             ));
         }
 
-        if self.position >= self.config.max_sequence_length {
-            return Err(FerrisError::new(
+        let sample = self.last_sample.ok_or_else(|| {
+            FerrisError::new(
                 ErrorKind::Runtime,
-                "cannot generate beyond max sequence length",
-            ));
-        }
-
-        let logits = decoder_model_last_token_logits_f32(self.model.as_ref(), &self.token_history)?;
-        let sample = argmax_last_token(&logits)?;
-        self.prefill_tokens(&[sample.token_id])?;
+                "step_reference requires a sampled token from a prefetched token",
+            )
+        })?;
+        self.process_reference_token(sample.token_id)?;
         Ok(sample)
     }
 
@@ -241,6 +253,61 @@ impl Session {
             generated_text,
             finish_reason,
         })
+    }
+
+    fn process_reference_token(&mut self, token_id: u32) -> Result<()> {
+        if self.position >= self.config.max_sequence_length {
+            return Err(FerrisError::new(
+                ErrorKind::Runtime,
+                "cannot process tokens beyond max sequence length",
+            ));
+        }
+
+        if self.position != self.kv_cache.used_tokens() {
+            return Err(FerrisError::new(
+                ErrorKind::Runtime,
+                "session position and KV cache usage diverged",
+            ));
+        }
+
+        let sample = decoder_model_token_sample_with_kv_cache_f32(
+            self.model.as_ref(),
+            token_id,
+            &mut self.kv_cache,
+            self.position,
+        )?;
+        self.kv_cache.advance(1)?;
+        self.position = self
+            .position
+            .checked_add(1)
+            .ok_or_else(|| FerrisError::new(ErrorKind::Runtime, "session position overflow"))?;
+        self.token_history.push(token_id);
+        self.last_sample = Some(sample);
+        Ok(())
+    }
+
+    fn process_reference_prefill_tokens(&mut self, token_ids: &[u32]) -> Result<()> {
+        let next_position = self
+            .position
+            .checked_add(token_ids.len())
+            .ok_or_else(|| FerrisError::new(ErrorKind::Runtime, "session position overflow"))?;
+        if next_position > self.config.max_sequence_length {
+            return Err(FerrisError::new(
+                ErrorKind::Runtime,
+                "cannot process tokens beyond max sequence length",
+            ));
+        }
+
+        let sample = decoder_model_prefill_last_token_sample_with_kv_cache_f32(
+            self.model.as_ref(),
+            token_ids,
+            &mut self.kv_cache,
+        )?;
+        self.kv_cache.advance(token_ids.len())?;
+        self.position = next_position;
+        self.token_history.extend_from_slice(token_ids);
+        self.last_sample = Some(sample);
+        Ok(())
     }
 }
 
@@ -319,6 +386,19 @@ mod tests {
         assert_eq!(session.position(), 1);
         assert_eq!(session.kv_cache().used_tokens(), 1);
         assert_eq!(session.token_history(), &[0]);
+    }
+
+    #[test]
+    fn prefill_tokens_batches_initial_prompt_and_preserves_last_sample() {
+        let mut session = test_session(SessionConfig::default());
+
+        session.prefill_tokens(&[0, 1]).unwrap();
+        let sample = session.step_reference().unwrap();
+
+        assert_eq!(session.position(), 3);
+        assert_eq!(session.kv_cache().used_tokens(), 3);
+        assert_eq!(session.token_history(), &[0, 1, 1]);
+        assert_eq!(sample.token_id, 1);
     }
 
     #[test]

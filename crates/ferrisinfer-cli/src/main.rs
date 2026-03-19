@@ -9,6 +9,7 @@ use ferrisinfer_runtime::{ExecutionMode, GenerationRequest, InferenceEngine, Ses
 
 const DEFAULT_HF_PATH: &str = "models/Qwen2.5-0.5B-Instruct";
 const DEFAULT_SYSTEM_PROMPT_PATH: &str = "docs/system_prompt.md";
+const DEFAULT_SHORT_SYSTEM_PROMPT_PATH: &str = "docs/system_prompt_short.md";
 
 fn main() {
     let engine = InferenceEngine::new(CpuBackend::default());
@@ -21,13 +22,25 @@ fn main() {
         }
         Some("inspect-hf") => inspect_hf(args.get(2).map(String::as_str)),
         Some("render-chat-hf") => render_chat_hf(args.get(2).map(String::as_str)),
+        Some("render-chat-hf-short") => {
+            render_chat_hf_with_prompt(args.get(2).map(String::as_str), default_short_system_prompt_path())
+        }
         Some("tokenize-hf") => tokenize_hf(args.get(2).map(String::as_str)),
         Some("tokenize-file-hf") => tokenize_file_hf(args.get(2).map(String::as_str)),
         Some("smoke-hf") => smoke_hf(&engine, args.get(2).map(String::as_str)),
+        Some("smoke-hf-short") => {
+            smoke_hf_with_prompt(&engine, args.get(2).map(String::as_str), default_short_system_prompt_path())
+        }
         Some("generate-hf") => generate_hf(
             &engine,
             args.get(2).map(String::as_str),
             args.get(3).map(String::as_str),
+        ),
+        Some("generate-hf-short") => generate_hf_with_prompt(
+            &engine,
+            args.get(2).map(String::as_str),
+            args.get(3).map(String::as_str),
+            default_short_system_prompt_path(),
         ),
         Some("help") | None => {
             print_help();
@@ -55,6 +68,9 @@ fn print_help() {
         "  render-chat-hf [text]          Render the default Qwen chat prompt for a user message"
     );
     println!(
+        "  render-chat-hf-short [text]    Render the short test system prompt for a user message"
+    );
+    println!(
         "  tokenize-hf [text]             Tokenize plain text with the default local HF tokenizer"
     );
     println!(
@@ -62,7 +78,13 @@ fn print_help() {
     );
     println!("  smoke-hf [text]                Run a reference next-token smoke test on the local HF model");
     println!(
+        "  smoke-hf-short [text]          Run the smoke test with docs/system_prompt_short.md"
+    );
+    println!(
         "  generate-hf [text] [tokens]    Run reference generation with docs/system_prompt.md"
+    );
+    println!(
+        "  generate-hf-short [text] [tokens] Run reference generation with docs/system_prompt_short.md"
     );
 }
 
@@ -170,14 +192,18 @@ fn inspect_hf(path: Option<&str>) -> Result<(), ()> {
 }
 
 fn render_chat_hf(text: Option<&str>) -> Result<(), ()> {
+    render_chat_hf_with_prompt(text, default_system_prompt_path())
+}
+
+fn render_chat_hf_with_prompt(text: Option<&str>, system_prompt_path: &str) -> Result<(), ()> {
     let tokenizer = load_default_hf_tokenizer()?;
     let user_text = text.unwrap_or("请你用一句话概括这份 system prompt 的核心约束。");
-    let system_prompt = load_default_system_prompt()?;
+    let system_prompt = load_system_prompt(system_prompt_path)?;
     let rendered = render_default_chat_prompt(&tokenizer, user_text, &system_prompt)?;
 
     println!("FerrisInfer rendered chat prompt");
     println!("model path: {}", default_hf_path());
-    println!("system prompt path: {}", default_system_prompt_path());
+    println!("system prompt path: {}", system_prompt_path);
     println!("system prompt chars: {}", system_prompt.chars().count());
     println!("chars: {}", rendered.chars().count());
     println!("bytes: {}", rendered.len());
@@ -217,12 +243,20 @@ fn tokenize_file_hf(path: Option<&str>) -> Result<(), ()> {
 }
 
 fn smoke_hf(engine: &InferenceEngine<CpuBackend>, text: Option<&str>) -> Result<(), ()> {
+    smoke_hf_with_prompt(engine, text, default_system_prompt_path())
+}
+
+fn smoke_hf_with_prompt(
+    engine: &InferenceEngine<CpuBackend>,
+    text: Option<&str>,
+    system_prompt_path: &str,
+) -> Result<(), ()> {
     let user_text = text.unwrap_or("请只回复一个词：OK");
-    let report = run_reference_generation(engine, user_text, 1)?;
+    let report = run_reference_generation(engine, user_text, 1, system_prompt_path)?;
 
     println!("FerrisInfer reference smoke test");
     println!("model path: {}", default_hf_path());
-    println!("system prompt path: {}", default_system_prompt_path());
+    println!("system prompt path: {}", system_prompt_path);
     println!("user text: {}", preview_text(user_text, 120));
     println!("rendered prompt chars: {}", report.rendered.chars().count());
     println!("prompt tokens: {}", report.prompt_token_ids.len());
@@ -256,13 +290,22 @@ fn generate_hf(
     text: Option<&str>,
     max_new_tokens: Option<&str>,
 ) -> Result<(), ()> {
+    generate_hf_with_prompt(engine, text, max_new_tokens, default_system_prompt_path())
+}
+
+fn generate_hf_with_prompt(
+    engine: &InferenceEngine<CpuBackend>,
+    text: Option<&str>,
+    max_new_tokens: Option<&str>,
+    system_prompt_path: &str,
+) -> Result<(), ()> {
     let user_text = text.unwrap_or("请用一句话概括这份 system prompt 的核心限制。");
     let max_new_tokens = parse_max_new_tokens(max_new_tokens, 4)?;
-    let report = run_reference_generation(engine, user_text, max_new_tokens)?;
+    let report = run_reference_generation(engine, user_text, max_new_tokens, system_prompt_path)?;
 
     println!("FerrisInfer reference generation");
     println!("model path: {}", default_hf_path());
-    println!("system prompt path: {}", default_system_prompt_path());
+    println!("system prompt path: {}", system_prompt_path);
     println!("user text: {}", preview_text(user_text, 120));
     println!("requested max new tokens: {}", max_new_tokens);
     println!("rendered prompt chars: {}", report.rendered.chars().count());
@@ -297,6 +340,7 @@ fn run_reference_generation(
     engine: &InferenceEngine<CpuBackend>,
     user_text: &str,
     max_new_tokens: usize,
+    system_prompt_path: &str,
 ) -> Result<ReferenceGenerationReport, ()> {
     let mut source = HfSource::new(default_hf_path());
     let tokenizer_asset = source.load_tokenizer().map_err(|error| {
@@ -307,7 +351,7 @@ fn run_reference_generation(
         );
     })?;
     let tokenizer = VocabularyTokenizer::new(tokenizer_asset);
-    let system_prompt = load_default_system_prompt()?;
+    let system_prompt = load_system_prompt(system_prompt_path)?;
     let rendered = render_default_chat_prompt(&tokenizer, user_text, &system_prompt)?;
     let token_ids = tokenizer.encode(&rendered, false).map_err(|error| {
         eprintln!("failed to tokenize rendered prompt: {}", error);
@@ -363,20 +407,16 @@ fn load_default_hf_tokenizer() -> Result<VocabularyTokenizer, ()> {
     Ok(VocabularyTokenizer::new(asset))
 }
 
-fn load_default_system_prompt() -> Result<String, ()> {
-    let text = fs::read_to_string(default_system_prompt_path()).map_err(|error| {
+fn load_system_prompt(path: &str) -> Result<String, ()> {
+    let text = fs::read_to_string(path).map_err(|error| {
         eprintln!(
             "failed to read system prompt '{}': {}",
-            default_system_prompt_path(),
-            error
+            path, error
         );
     })?;
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        eprintln!(
-            "system prompt '{}' is empty after trimming whitespace",
-            default_system_prompt_path()
-        );
+        eprintln!("system prompt '{}' is empty after trimming whitespace", path);
         return Err(());
     }
     Ok(trimmed.to_string())
@@ -438,6 +478,10 @@ fn preview_text(text: &str, max_chars: usize) -> String {
     } else {
         preview.replace('\n', "\\n")
     }
+}
+
+fn default_short_system_prompt_path() -> &'static str {
+    DEFAULT_SHORT_SYSTEM_PROMPT_PATH
 }
 
 fn preview_token_ids(tokens: &[u32], max_items: usize) -> String {

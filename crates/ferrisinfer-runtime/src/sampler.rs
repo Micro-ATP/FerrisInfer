@@ -48,7 +48,7 @@ pub fn argmax_last_token(logits: &Tensor) -> Result<TokenSample> {
         ));
     }
 
-    let values = logits.to_vec_f32()?;
+    let values = logits.as_f32_slice()?;
     let row = &values[(seq_len - 1) * vocab_size..seq_len * vocab_size];
 
     let (best_index, &best_logit) = row

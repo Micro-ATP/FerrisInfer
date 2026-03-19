@@ -133,6 +133,96 @@ impl KvCache {
         value: &Tensor,
     ) -> Result<()> {
         self.ensure_position_committed(position)?;
+        self.write_slot_f32(layer_index, position, key, value)
+    }
+
+    pub fn write_uncommitted_f32(
+        &mut self,
+        layer_index: usize,
+        position: usize,
+        key: &Tensor,
+        value: &Tensor,
+    ) -> Result<()> {
+        if position > self.used_tokens {
+            return Err(FerrisError::new(
+                ErrorKind::InvalidShape,
+                format!(
+                    "KV cache position {position} is beyond the next writable slot {}; committed tokens {}",
+                    self.used_tokens,
+                    self.used_tokens
+                ),
+            ));
+        }
+
+        self.write_slot_f32(layer_index, position, key, value)
+    }
+
+    pub fn write_sequence_uncommitted_f32(
+        &mut self,
+        layer_index: usize,
+        start_position: usize,
+        key: &Tensor,
+        value: &Tensor,
+    ) -> Result<()> {
+        validate_sequence_tensor(key, self.config.num_kv_heads, self.config.head_dim, "key")?;
+        validate_sequence_tensor(
+            value,
+            self.config.num_kv_heads,
+            self.config.head_dim,
+            "value",
+        )?;
+
+        if key.shape().dims() != value.shape().dims() {
+            return Err(FerrisError::new(
+                ErrorKind::InvalidShape,
+                "KV cache key/value sequence tensors must have matching shapes",
+            ));
+        }
+
+        if start_position > self.used_tokens {
+            return Err(FerrisError::new(
+                ErrorKind::InvalidShape,
+                format!(
+                    "KV cache sequence start {start_position} is beyond committed tokens {}",
+                    self.used_tokens
+                ),
+            ));
+        }
+
+        let seq_len = key.shape().dims()[0];
+        let end_position = start_position.checked_add(seq_len).ok_or_else(|| {
+            FerrisError::new(ErrorKind::Runtime, "KV cache sequence end overflow")
+        })?;
+        if end_position > self.config.max_sequence_length {
+            return Err(FerrisError::new(
+                ErrorKind::Runtime,
+                "KV cache capacity exceeded",
+            ));
+        }
+
+        let slot_width = self.config.num_kv_heads * self.config.head_dim;
+        let element_offset = start_position
+            .checked_mul(slot_width)
+            .ok_or_else(|| FerrisError::new(ErrorKind::Runtime, "KV cache write offset overflow"))?;
+        let layer = self.layers.get_mut(layer_index).ok_or_else(|| {
+            FerrisError::new(
+                ErrorKind::InvalidShape,
+                format!("KV cache layer index out of bounds: {layer_index}"),
+            )
+        })?;
+
+        layer.key.copy_from_tensor_f32_at(element_offset, key)?;
+        layer.value.copy_from_tensor_f32_at(element_offset, value)?;
+        Ok(())
+    }
+
+    fn write_slot_f32(
+        &mut self,
+        layer_index: usize,
+        position: usize,
+        key: &Tensor,
+        value: &Tensor,
+    ) -> Result<()> {
         validate_slot_tensor(key, self.config.num_kv_heads, self.config.head_dim, "key")?;
         validate_slot_tensor(
             value,
@@ -142,8 +232,6 @@ impl KvCache {
         )?;
 
         let slot_width = self.config.num_kv_heads * self.config.head_dim;
-        let key_values = key.to_vec_f32()?;
-        let value_values = value.to_vec_f32()?;
         let layer = self.layers.get_mut(layer_index).ok_or_else(|| {
             FerrisError::new(
                 ErrorKind::InvalidShape,
@@ -154,14 +242,8 @@ impl KvCache {
             FerrisError::new(ErrorKind::Runtime, "KV cache write offset overflow")
         })?;
 
-        for (offset, element) in key_values.iter().copied().enumerate() {
-            layer.key.write_f32(start + offset, element)?;
-        }
-
-        for (offset, element) in value_values.iter().copied().enumerate() {
-            layer.value.write_f32(start + offset, element)?;
-        }
-
+        layer.key.copy_from_tensor_f32_at(start, key)?;
+        layer.value.copy_from_tensor_f32_at(start, value)?;
         Ok(())
     }
 
@@ -189,13 +271,13 @@ impl KvCache {
             .and_then(|count| count.checked_mul(self.config.head_dim))
             .ok_or_else(|| FerrisError::new(ErrorKind::Runtime, "KV cache prefix size overflow"))?;
         let shape = Shape::from_slice(&[length, self.config.num_kv_heads, self.config.head_dim])?;
-
-        let key_values = layer.key.to_vec_f32()?;
-        let value_values = layer.value.to_vec_f32()?;
+        let prefix_bytes = prefix_elements
+            .checked_mul(DType::F32.size_in_bytes())
+            .ok_or_else(|| FerrisError::new(ErrorKind::Runtime, "KV cache prefix byte size overflow"))?;
 
         Ok((
-            Tensor::from_f32_vec(shape.clone(), key_values[..prefix_elements].to_vec())?,
-            Tensor::from_f32_vec(shape, value_values[..prefix_elements].to_vec())?,
+            Tensor::from_owned_bytes(DType::F32, shape.clone(), layer.key.as_bytes()[..prefix_bytes].to_vec())?,
+            Tensor::from_owned_bytes(DType::F32, shape, layer.value.as_bytes()[..prefix_bytes].to_vec())?,
         ))
     }
 
@@ -227,6 +309,33 @@ fn validate_slot_tensor(
         return Err(FerrisError::new(
             ErrorKind::InvalidShape,
             format!("KV cache {label} tensor must have shape [{num_kv_heads}, {head_dim}]",),
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_sequence_tensor(
+    tensor: &Tensor,
+    num_kv_heads: usize,
+    head_dim: usize,
+    label: &str,
+) -> Result<()> {
+    tensor.ensure_dtype(DType::F32)?;
+    tensor.ensure_contiguous()?;
+
+    if tensor.shape().rank() != 3 {
+        return Err(FerrisError::new(
+            ErrorKind::InvalidShape,
+            format!("KV cache {label} sequence tensor must have shape [seq_len, {num_kv_heads}, {head_dim}]"),
+        ));
+    }
+
+    let dims = tensor.shape().dims();
+    if dims[1] != num_kv_heads || dims[2] != head_dim {
+        return Err(FerrisError::new(
+            ErrorKind::InvalidShape,
+            format!("KV cache {label} sequence tensor must have shape [seq_len, {num_kv_heads}, {head_dim}]"),
         ));
     }
 
@@ -306,5 +415,37 @@ mod tests {
         cache.reset();
         assert_eq!(cache.used_tokens(), 0);
         assert_eq!(cache.remaining_tokens(), 8);
+    }
+
+    #[test]
+    fn kv_cache_write_sequence_uncommitted_round_trip() {
+        let mut cache = KvCache::new(KvCacheConfig {
+            num_layers: 1,
+            num_kv_heads: 1,
+            head_dim: 2,
+            max_sequence_length: 8,
+            dtype: DType::F32,
+        })
+        .unwrap();
+
+        let keys = Tensor::from_f32_vec(
+            Shape::from_slice(&[2, 1, 2]).unwrap(),
+            vec![1.0, 2.0, 5.0, 6.0],
+        )
+        .unwrap();
+        let values = Tensor::from_f32_vec(
+            Shape::from_slice(&[2, 1, 2]).unwrap(),
+            vec![3.0, 4.0, 7.0, 8.0],
+        )
+        .unwrap();
+
+        cache
+            .write_sequence_uncommitted_f32(0, 0, &keys, &values)
+            .unwrap();
+        cache.advance(2).unwrap();
+
+        let (read_keys, read_values) = cache.read_prefix_f32(0, 2).unwrap();
+        assert_eq!(read_keys.to_vec_f32().unwrap(), vec![1.0, 2.0, 5.0, 6.0]);
+        assert_eq!(read_values.to_vec_f32().unwrap(), vec![3.0, 4.0, 7.0, 8.0]);
     }
 }

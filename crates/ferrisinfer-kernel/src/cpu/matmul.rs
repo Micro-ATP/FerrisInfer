@@ -38,8 +38,8 @@ pub fn matmul_f32(lhs: &Tensor, rhs: &Tensor, out: &mut Tensor) -> Result<()> {
         ));
     }
 
-    let lhs_values = lhs.to_vec_f32()?;
-    let rhs_values = rhs.to_vec_f32()?;
+    let lhs_values = lhs.as_f32_slice()?;
+    let rhs_values = rhs.as_f32_slice()?;
     let mut out_values = vec![0.0f32; m * n];
     let thread_count = preferred_thread_count(m, n, k);
 
@@ -77,12 +77,15 @@ fn compute_row_chunk(
         let lhs_row = &lhs_values[row * k..(row + 1) * k];
         let out_row = &mut out_chunk[local_row * n..(local_row + 1) * n];
 
-        for (col, slot) in out_row.iter_mut().enumerate() {
-            let mut sum = 0.0f32;
-            for (inner, lhs_value) in lhs_row.iter().copied().enumerate() {
-                sum += lhs_value * rhs_values[inner * n + col];
+        for (inner, lhs_value) in lhs_row.iter().copied().enumerate() {
+            if lhs_value == 0.0 {
+                continue;
             }
-            *slot = sum;
+
+            let rhs_row = &rhs_values[inner * n..(inner + 1) * n];
+            for (slot, rhs_value) in out_row.iter_mut().zip(rhs_row.iter().copied()) {
+                *slot += lhs_value * rhs_value;
+            }
         }
     }
 }

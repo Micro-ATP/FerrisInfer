@@ -8,43 +8,51 @@ pub fn zero_tensor(tensor: &mut Tensor) -> Result<()> {
 pub fn add_f32(lhs: &Tensor, rhs: &Tensor, out: &mut Tensor) -> Result<()> {
     validate_same_shape(lhs, rhs, out)?;
 
-    let lhs_values = lhs.to_vec_f32()?;
-    let rhs_values = rhs.to_vec_f32()?;
-    let mut out_values = Vec::with_capacity(out.element_count());
+    let lhs_values = lhs.as_f32_slice()?;
+    let rhs_values = rhs.as_f32_slice()?;
+    let out_values = out.as_f32_slice_mut()?;
 
-    for (lhs_value, rhs_value) in lhs_values.into_iter().zip(rhs_values) {
-        out_values.push(lhs_value + rhs_value);
+    for ((slot, lhs_value), rhs_value) in out_values
+        .iter_mut()
+        .zip(lhs_values.iter().copied())
+        .zip(rhs_values.iter().copied())
+    {
+        *slot = lhs_value + rhs_value;
     }
 
-    out.copy_from_f32_slice(&out_values)
+    Ok(())
 }
 
 pub fn mul_f32(lhs: &Tensor, rhs: &Tensor, out: &mut Tensor) -> Result<()> {
     validate_same_shape(lhs, rhs, out)?;
 
-    let lhs_values = lhs.to_vec_f32()?;
-    let rhs_values = rhs.to_vec_f32()?;
-    let mut out_values = Vec::with_capacity(out.element_count());
+    let lhs_values = lhs.as_f32_slice()?;
+    let rhs_values = rhs.as_f32_slice()?;
+    let out_values = out.as_f32_slice_mut()?;
 
-    for (lhs_value, rhs_value) in lhs_values.into_iter().zip(rhs_values) {
-        out_values.push(lhs_value * rhs_value);
+    for ((slot, lhs_value), rhs_value) in out_values
+        .iter_mut()
+        .zip(lhs_values.iter().copied())
+        .zip(rhs_values.iter().copied())
+    {
+        *slot = lhs_value * rhs_value;
     }
 
-    out.copy_from_f32_slice(&out_values)
+    Ok(())
 }
 
 pub fn silu_f32(input: &Tensor, out: &mut Tensor) -> Result<()> {
     validate_unary_f32(input, out)?;
 
-    let input_values = input.to_vec_f32()?;
-    let mut out_values = Vec::with_capacity(out.element_count());
+    let input_values = input.as_f32_slice()?;
+    let out_values = out.as_f32_slice_mut()?;
 
-    for value in input_values {
+    for (slot, value) in out_values.iter_mut().zip(input_values.iter().copied()) {
         let sigmoid = 1.0 / (1.0 + (-value).exp());
-        out_values.push(value * sigmoid);
+        *slot = value * sigmoid;
     }
 
-    out.copy_from_f32_slice(&out_values)
+    Ok(())
 }
 
 fn validate_same_shape(lhs: &Tensor, rhs: &Tensor, out: &Tensor) -> Result<()> {

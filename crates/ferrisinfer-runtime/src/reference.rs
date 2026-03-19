@@ -1,11 +1,15 @@
 use ferrisinfer_core::{DType, ErrorKind, FerrisError, Result, Shape, Tensor};
 use ferrisinfer_kernel::cpu::attention::{
-    causal_self_attention_f32, embedding_gather_f32, merge_heads_f32, rope_f32, split_heads_f32,
+    causal_self_attention_f32, decode_causal_attention_f32, embedding_gather_f32,
+    merge_heads_f32, rope_f32, split_heads_f32,
 };
 use ferrisinfer_kernel::cpu::elementwise::{add_f32, mul_f32, silu_f32};
 use ferrisinfer_kernel::cpu::matmul::matmul_f32;
 use ferrisinfer_kernel::cpu::reduction::rms_norm_f32;
 use ferrisinfer_model::{ActivationKind, AttentionLayout, DecoderOnlyModel, ModelConfig, NormKind};
+
+use crate::kv_cache::KvCache;
+use crate::sampler::TokenSample;
 
 pub struct ReferenceDecoderBlockWeights<'a> {
     pub attention_norm: &'a Tensor,
@@ -42,6 +46,127 @@ pub fn decoder_block_forward_f32(
     weights: &ReferenceDecoderBlockWeights<'_>,
     config: ReferenceBlockConfig,
 ) -> Result<Tensor> {
+    let (output, _, _) =
+        decoder_block_forward_with_kv_capture_f32(input, weights, config, 0)?;
+    Ok(output)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn decoder_model_prefill_last_token_logits_with_kv_cache_f32(
+    model: &DecoderOnlyModel,
+    token_ids: &[u32],
+    kv_cache: &mut KvCache,
+) -> Result<Tensor> {
+    validate_supported_reference_model(model.config())?;
+
+    if token_ids.is_empty() {
+        return Err(FerrisError::new(
+            ErrorKind::InvalidShape,
+            "prefill reference path requires at least one token",
+        ));
+    }
+
+    if kv_cache.used_tokens() != 0 {
+        return Err(FerrisError::new(
+            ErrorKind::Runtime,
+            "batch prefill requires an empty KV cache",
+        ));
+    }
+
+    if token_ids.len() > kv_cache.remaining_tokens() {
+        return Err(FerrisError::new(
+            ErrorKind::Runtime,
+            "batch prefill exceeds KV cache capacity",
+        ));
+    }
+
+    let config = model.config();
+    let embedding = get_weight(model, "tok_embeddings.weight")?;
+    let mut hidden = zeros_2d(token_ids.len(), config.hidden_size)?;
+    embedding_gather_f32(embedding, token_ids, &mut hidden)?;
+
+    for layer in 0..config.num_layers {
+        let weights = block_weights(model, layer)?;
+        let (next_hidden, key_heads, value_heads) =
+            decoder_block_forward_with_kv_capture_f32(&hidden, &weights, block_config(config), 0)?;
+        kv_cache.write_sequence_uncommitted_f32(layer, 0, &key_heads, &value_heads)?;
+        hidden = next_hidden;
+    }
+
+    let mut normalized = zeros_2d(token_ids.len(), config.hidden_size)?;
+    rms_norm_f32(
+        &hidden,
+        get_weight(model, "norm.weight")?,
+        &mut normalized,
+        config.norm.epsilon,
+    )?;
+
+    let last_hidden = select_last_row_f32(&normalized)?;
+    let output_weight = output_weight(model)?;
+    let mut logits = zeros_2d(1, config.vocab_size)?;
+    linear_right_transposed_f32(&last_hidden, output_weight, &mut logits)?;
+    Ok(logits)
+}
+
+pub(crate) fn decoder_model_prefill_last_token_sample_with_kv_cache_f32(
+    model: &DecoderOnlyModel,
+    token_ids: &[u32],
+    kv_cache: &mut KvCache,
+) -> Result<TokenSample> {
+    validate_supported_reference_model(model.config())?;
+
+    if token_ids.is_empty() {
+        return Err(FerrisError::new(
+            ErrorKind::InvalidShape,
+            "prefill reference path requires at least one token",
+        ));
+    }
+
+    if kv_cache.used_tokens() != 0 {
+        return Err(FerrisError::new(
+            ErrorKind::Runtime,
+            "batch prefill requires an empty KV cache",
+        ));
+    }
+
+    if token_ids.len() > kv_cache.remaining_tokens() {
+        return Err(FerrisError::new(
+            ErrorKind::Runtime,
+            "batch prefill exceeds KV cache capacity",
+        ));
+    }
+
+    let config = model.config();
+    let embedding = get_weight(model, "tok_embeddings.weight")?;
+    let mut hidden = zeros_2d(token_ids.len(), config.hidden_size)?;
+    embedding_gather_f32(embedding, token_ids, &mut hidden)?;
+
+    for layer in 0..config.num_layers {
+        let weights = block_weights(model, layer)?;
+        let (next_hidden, key_heads, value_heads) =
+            decoder_block_forward_with_kv_capture_f32(&hidden, &weights, block_config(config), 0)?;
+        kv_cache.write_sequence_uncommitted_f32(layer, 0, &key_heads, &value_heads)?;
+        hidden = next_hidden;
+    }
+
+    let mut normalized = zeros_2d(token_ids.len(), config.hidden_size)?;
+    rms_norm_f32(
+        &hidden,
+        get_weight(model, "norm.weight")?,
+        &mut normalized,
+        config.norm.epsilon,
+    )?;
+
+    let last_hidden = select_last_row_f32(&normalized)?;
+    linear_right_transposed_argmax_f32(&last_hidden, output_weight(model)?)
+}
+
+fn decoder_block_forward_with_kv_capture_f32(
+    input: &Tensor,
+    weights: &ReferenceDecoderBlockWeights<'_>,
+    config: ReferenceBlockConfig,
+    position_offset: usize,
+) -> Result<(Tensor, Tensor, Tensor)> {
     input.ensure_dtype(DType::F32)?;
     input.ensure_contiguous()?;
 
@@ -108,7 +233,7 @@ pub fn decoder_block_forward_f32(
     rope_f32(
         &mut query_heads,
         &mut key_heads,
-        0,
+        position_offset,
         config.rotary_dims,
         config.rope_theta,
     )?;
@@ -159,7 +284,7 @@ pub fn decoder_block_forward_f32(
 
     let mut output = zeros_2d(seq_len, hidden_size)?;
     add_f32(&residual, &mlp_output, &mut output)?;
-    Ok(output)
+    Ok((output, key_heads, value_heads))
 }
 
 pub fn decoder_model_forward_f32(model: &DecoderOnlyModel, token_ids: &[u32]) -> Result<Tensor> {
@@ -182,6 +307,81 @@ pub fn decoder_model_last_token_logits_f32(
     let mut logits = zeros_2d(1, model.config().vocab_size)?;
     linear_right_transposed_f32(&last_hidden, output_weight, &mut logits)?;
     Ok(logits)
+}
+
+pub fn decoder_model_token_logits_with_kv_cache_f32(
+    model: &DecoderOnlyModel,
+    token_id: u32,
+    kv_cache: &mut KvCache,
+    position: usize,
+) -> Result<Tensor> {
+    validate_supported_reference_model(model.config())?;
+
+    let config = model.config();
+    let embedding = get_weight(model, "tok_embeddings.weight")?;
+    let mut hidden = zeros_2d(1, config.hidden_size)?;
+    embedding_gather_f32(embedding, &[token_id], &mut hidden)?;
+
+    for layer in 0..config.num_layers {
+        let weights = block_weights(model, layer)?;
+        hidden = decoder_block_decode_step_f32(
+            &hidden,
+            &weights,
+            block_config(config),
+            kv_cache,
+            layer,
+            position,
+        )?;
+    }
+
+    let mut normalized = zeros_2d(1, config.hidden_size)?;
+    rms_norm_f32(
+        &hidden,
+        get_weight(model, "norm.weight")?,
+        &mut normalized,
+        config.norm.epsilon,
+    )?;
+
+    let output_weight = output_weight(model)?;
+    let mut logits = zeros_2d(1, config.vocab_size)?;
+    linear_right_transposed_f32(&normalized, output_weight, &mut logits)?;
+    Ok(logits)
+}
+
+pub(crate) fn decoder_model_token_sample_with_kv_cache_f32(
+    model: &DecoderOnlyModel,
+    token_id: u32,
+    kv_cache: &mut KvCache,
+    position: usize,
+) -> Result<TokenSample> {
+    validate_supported_reference_model(model.config())?;
+
+    let config = model.config();
+    let embedding = get_weight(model, "tok_embeddings.weight")?;
+    let mut hidden = zeros_2d(1, config.hidden_size)?;
+    embedding_gather_f32(embedding, &[token_id], &mut hidden)?;
+
+    for layer in 0..config.num_layers {
+        let weights = block_weights(model, layer)?;
+        hidden = decoder_block_decode_step_f32(
+            &hidden,
+            &weights,
+            block_config(config),
+            kv_cache,
+            layer,
+            position,
+        )?;
+    }
+
+    let mut normalized = zeros_2d(1, config.hidden_size)?;
+    rms_norm_f32(
+        &hidden,
+        get_weight(model, "norm.weight")?,
+        &mut normalized,
+        config.norm.epsilon,
+    )?;
+
+    linear_right_transposed_argmax_f32(&normalized, output_weight(model)?)
 }
 
 fn decoder_model_hidden_f32(model: &DecoderOnlyModel, token_ids: &[u32]) -> Result<Tensor> {
@@ -214,6 +414,120 @@ fn decoder_model_hidden_f32(model: &DecoderOnlyModel, token_ids: &[u32]) -> Resu
     Ok(normalized)
 }
 
+fn decoder_block_decode_step_f32(
+    input: &Tensor,
+    weights: &ReferenceDecoderBlockWeights<'_>,
+    config: ReferenceBlockConfig,
+    kv_cache: &mut KvCache,
+    layer_index: usize,
+    position: usize,
+) -> Result<Tensor> {
+    input.ensure_dtype(DType::F32)?;
+    input.ensure_contiguous()?;
+
+    if input.shape().dims() != [1, config.num_heads * config.head_dim] {
+        return Err(FerrisError::new(
+            ErrorKind::InvalidShape,
+            "decoder block decode step requires input shape [1, hidden_size]",
+        ));
+    }
+
+    let hidden_size = config.num_heads * config.head_dim;
+    let kv_hidden_size = config.num_kv_heads * config.head_dim;
+
+    let mut normed = zeros_2d(1, hidden_size)?;
+    rms_norm_f32(
+        input,
+        weights.attention_norm,
+        &mut normed,
+        config.rms_norm_epsilon,
+    )?;
+
+    let mut query = zeros_2d(1, hidden_size)?;
+    let mut key = zeros_2d(1, kv_hidden_size)?;
+    let mut value = zeros_2d(1, kv_hidden_size)?;
+    linear_f32_with_bias(&normed, weights.wq, weights.wq_bias, &mut query)?;
+    linear_f32_with_bias(&normed, weights.wk, weights.wk_bias, &mut key)?;
+    linear_f32_with_bias(&normed, weights.wv, weights.wv_bias, &mut value)?;
+
+    let mut query_heads = zeros_3d(1, config.num_heads, config.head_dim)?;
+    let mut key_heads = zeros_3d(1, config.num_kv_heads, config.head_dim)?;
+    let mut value_heads = zeros_3d(1, config.num_kv_heads, config.head_dim)?;
+    split_heads_f32(&query, config.num_heads, &mut query_heads)?;
+    split_heads_f32(&key, config.num_kv_heads, &mut key_heads)?;
+    split_heads_f32(&value, config.num_kv_heads, &mut value_heads)?;
+
+    rope_f32(
+        &mut query_heads,
+        &mut key_heads,
+        position,
+        config.rotary_dims,
+        config.rope_theta,
+    )?;
+
+    let key_slot = attention_slot_tensor_f32(&key_heads, config.num_kv_heads, config.head_dim)?;
+    let value_slot = attention_slot_tensor_f32(&value_heads, config.num_kv_heads, config.head_dim)?;
+    let cache_layer = kv_cache.layer(layer_index)?;
+
+    let mut attention_heads = zeros_3d(1, config.num_heads, config.head_dim)?;
+    decode_causal_attention_f32(
+        &query_heads,
+        cache_layer.key(),
+        cache_layer.value(),
+        position,
+        &key_slot,
+        &value_slot,
+        &mut attention_heads,
+    )?;
+
+    kv_cache.write_uncommitted_f32(layer_index, position, &key_slot, &value_slot)?;
+
+    let mut attention_merged = zeros_2d(1, hidden_size)?;
+    merge_heads_f32(&attention_heads, &mut attention_merged)?;
+
+    let mut attention_projected = zeros_2d(1, hidden_size)?;
+    linear_f32_with_bias(
+        &attention_merged,
+        weights.wo,
+        weights.wo_bias,
+        &mut attention_projected,
+    )?;
+
+    let mut residual = zeros_2d(1, hidden_size)?;
+    add_f32(input, &attention_projected, &mut residual)?;
+
+    let mut ffn_input = zeros_2d(1, hidden_size)?;
+    rms_norm_f32(
+        &residual,
+        weights.ffn_norm,
+        &mut ffn_input,
+        config.rms_norm_epsilon,
+    )?;
+
+    let mut up_projection = zeros_2d(1, config.intermediate_size)?;
+    let mut gate_projection = zeros_2d(1, config.intermediate_size)?;
+    linear_f32_with_bias(&ffn_input, weights.w1, weights.w1_bias, &mut up_projection)?;
+    linear_f32_with_bias(
+        &ffn_input,
+        weights.w3,
+        weights.w3_bias,
+        &mut gate_projection,
+    )?;
+
+    let mut gated_activation = zeros_2d(1, config.intermediate_size)?;
+    silu_f32(&gate_projection, &mut gated_activation)?;
+
+    let mut gated_product = zeros_2d(1, config.intermediate_size)?;
+    mul_f32(&up_projection, &gated_activation, &mut gated_product)?;
+
+    let mut mlp_output = zeros_2d(1, hidden_size)?;
+    linear_f32_with_bias(&gated_product, weights.w2, weights.w2_bias, &mut mlp_output)?;
+
+    let mut output = zeros_2d(1, hidden_size)?;
+    add_f32(&residual, &mlp_output, &mut output)?;
+    Ok(output)
+}
+
 fn output_weight<'a>(model: &'a DecoderOnlyModel) -> Result<&'a Tensor> {
     if model.config().tie_word_embeddings {
         get_weight(model, "tok_embeddings.weight")
@@ -243,7 +557,7 @@ fn select_last_row_f32(input: &Tensor) -> Result<Tensor> {
         ));
     }
 
-    let values = input.to_vec_f32()?;
+    let values = input.as_f32_slice()?;
     let start = (rows - 1) * cols;
     Tensor::from_f32_vec(
         Shape::from_slice(&[1, cols])?,
@@ -328,6 +642,27 @@ fn get_optional_weight<'a>(model: &'a DecoderOnlyModel, name: &str) -> Option<&'
     model.weights().get(name)
 }
 
+fn attention_slot_tensor_f32(
+    tensor: &Tensor,
+    num_kv_heads: usize,
+    head_dim: usize,
+) -> Result<Tensor> {
+    tensor.ensure_dtype(DType::F32)?;
+    tensor.ensure_contiguous()?;
+
+    if tensor.shape().dims() != [1, num_kv_heads, head_dim] {
+        return Err(FerrisError::new(
+            ErrorKind::InvalidShape,
+            "attention slot tensor must have shape [1, num_kv_heads, head_dim]",
+        ));
+    }
+
+    Tensor::from_f32_vec(
+        Shape::from_slice(&[num_kv_heads, head_dim])?,
+        tensor.as_f32_slice()?.to_vec(),
+    )
+}
+
 fn linear_f32(input: &Tensor, weight: &Tensor, out: &mut Tensor) -> Result<()> {
     input.ensure_dtype(DType::F32)?;
     input.ensure_contiguous()?;
@@ -380,23 +715,25 @@ fn linear_f32_with_bias(
     }
 
     let out_dims = out.shape().dims();
-    if bias.shape().dims()[0] != out_dims[1] {
+    let out_rows = out_dims[0];
+    let out_cols = out_dims[1];
+    if bias.shape().dims()[0] != out_cols {
         return Err(FerrisError::new(
             ErrorKind::InvalidShape,
             "linear_f32_with_bias bias width must match output width",
         ));
     }
 
-    let bias_values = bias.to_vec_f32()?;
-    let mut out_values = out.to_vec_f32()?;
+    let bias_values = bias.as_f32_slice()?;
+    let out_values = out.as_f32_slice_mut()?;
 
-    for row in 0..out_dims[0] {
-        for col in 0..out_dims[1] {
-            out_values[row * out_dims[1] + col] += bias_values[col];
+    for row in 0..out_rows {
+        for col in 0..out_cols {
+            out_values[row * out_cols + col] += bias_values[col];
         }
     }
 
-    out.copy_from_f32_slice(&out_values)
+    Ok(())
 }
 
 fn linear_right_transposed_f32(input: &Tensor, weight: &Tensor, out: &mut Tensor) -> Result<()> {
@@ -429,8 +766,8 @@ fn linear_right_transposed_f32(input: &Tensor, weight: &Tensor, out: &mut Tensor
         ));
     }
 
-    let input_values = input.to_vec_f32()?;
-    let weight_values = weight.to_vec_f32()?;
+    let input_values = input.as_f32_slice()?;
+    let weight_values = weight.as_f32_slice()?;
     let mut out_values = vec![0.0f32; out.element_count()];
     let thread_count = preferred_transposed_linear_thread_count(rows, out_width, input_width);
 
@@ -496,6 +833,159 @@ fn linear_right_transposed_f32(input: &Tensor, weight: &Tensor, out: &mut Tensor
     out.copy_from_f32_slice(&out_values)
 }
 
+fn linear_right_transposed_argmax_f32(input: &Tensor, weight: &Tensor) -> Result<TokenSample> {
+    input.ensure_dtype(DType::F32)?;
+    input.ensure_contiguous()?;
+    weight.ensure_dtype(DType::F32)?;
+    weight.ensure_contiguous()?;
+
+    if input.shape().rank() != 2 || weight.shape().rank() != 2 {
+        return Err(FerrisError::new(
+            ErrorKind::InvalidShape,
+            "linear_right_transposed_argmax_f32 requires rank-2 tensors",
+        ));
+    }
+
+    let input_dims = input.shape().dims();
+    let weight_dims = weight.shape().dims();
+    if input_dims[0] != 1 || weight_dims[1] != input_dims[1] {
+        return Err(FerrisError::new(
+            ErrorKind::InvalidShape,
+            "linear_right_transposed_argmax_f32 expects input [1, k] and weight [n, k]",
+        ));
+    }
+
+    let input_width = input_dims[1];
+    let out_width = weight_dims[0];
+    if out_width == 0 {
+        return Err(FerrisError::new(
+            ErrorKind::InvalidShape,
+            "linear_right_transposed_argmax_f32 requires a non-empty output width",
+        ));
+    }
+
+    let input_values = input.as_f32_slice()?;
+    let weight_values = weight.as_f32_slice()?;
+    let thread_count = preferred_transposed_linear_thread_count(1, out_width, input_width);
+
+    let aggregate = if thread_count == 1 {
+        compute_linear_right_transposed_argmax_chunk(
+            &input_values,
+            &weight_values,
+            input_width,
+            0,
+            out_width,
+        )
+    } else {
+        let cols_per_chunk = out_width.div_ceil(thread_count);
+
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for chunk_index in 0..thread_count {
+                let col_start = chunk_index * cols_per_chunk;
+                if col_start >= out_width {
+                    break;
+                }
+
+                let col_end = (col_start + cols_per_chunk).min(out_width);
+                let input_values = &input_values;
+                let weight_values = &weight_values;
+
+                handles.push(scope.spawn(move || {
+                    compute_linear_right_transposed_argmax_chunk(
+                        input_values,
+                        weight_values,
+                        input_width,
+                        col_start,
+                        col_end,
+                    )
+                }));
+            }
+
+            let mut aggregate = None;
+            for handle in handles {
+                let chunk = handle.join().expect("scoped thread panicked");
+                aggregate = Some(match aggregate {
+                    Some(current) => merge_argmax_projection_chunks(current, chunk),
+                    None => chunk,
+                });
+            }
+
+            aggregate.expect("at least one argmax projection chunk")
+        })
+    };
+
+    Ok(TokenSample {
+        token_id: u32::try_from(aggregate.best_index).map_err(|_| {
+            FerrisError::new(ErrorKind::Runtime, "best token index does not fit into u32")
+        })?,
+        probability: 1.0 / aggregate.scaled_sum,
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ArgmaxProjectionChunk {
+    best_index: usize,
+    max_logit: f32,
+    scaled_sum: f32,
+}
+
+fn compute_linear_right_transposed_argmax_chunk(
+    input_values: &[f32],
+    weight_values: &[f32],
+    input_width: usize,
+    col_start: usize,
+    col_end: usize,
+) -> ArgmaxProjectionChunk {
+    let mut best_index = col_start;
+    let mut max_logit = f32::NEG_INFINITY;
+    let mut scaled_sum = 0.0f32;
+
+    for out_col in col_start..col_end {
+        let mut sum = 0.0f32;
+        for inner in 0..input_width {
+            sum += input_values[inner] * weight_values[out_col * input_width + inner];
+        }
+
+        if sum > max_logit {
+            scaled_sum = if max_logit.is_finite() {
+                scaled_sum * (max_logit - sum).exp() + 1.0
+            } else {
+                1.0
+            };
+            max_logit = sum;
+            best_index = out_col;
+        } else {
+            scaled_sum += (sum - max_logit).exp();
+        }
+    }
+
+    ArgmaxProjectionChunk {
+        best_index,
+        max_logit,
+        scaled_sum,
+    }
+}
+
+fn merge_argmax_projection_chunks(
+    left: ArgmaxProjectionChunk,
+    right: ArgmaxProjectionChunk,
+) -> ArgmaxProjectionChunk {
+    if left.max_logit >= right.max_logit {
+        ArgmaxProjectionChunk {
+            best_index: left.best_index,
+            max_logit: left.max_logit,
+            scaled_sum: left.scaled_sum + right.scaled_sum * (right.max_logit - left.max_logit).exp(),
+        }
+    } else {
+        ArgmaxProjectionChunk {
+            best_index: right.best_index,
+            max_logit: right.max_logit,
+            scaled_sum: right.scaled_sum + left.scaled_sum * (left.max_logit - right.max_logit).exp(),
+        }
+    }
+}
+
 fn compute_linear_right_transposed_chunk(
     input_values: &[f32],
     weight_values: &[f32],
@@ -553,6 +1043,8 @@ mod tests {
         ActivationKind, ArchitectureKind, AttentionLayout, AttentionSpec, DecoderOnlyModel,
         MlpSpec, ModelConfig, NormKind, NormSpec, RopeScalingKind, RopeSpec, WeightMap,
     };
+
+    use crate::kv_cache::{KvCache, KvCacheConfig};
 
     use super::*;
 
@@ -745,6 +1237,138 @@ mod tests {
             &last_logits.to_vec_f32().unwrap(),
             1e-5,
         );
+    }
+
+    #[test]
+    fn decoder_model_token_logits_with_kv_cache_matches_full_forward_last_row() {
+        let model = tiny_reference_model();
+        let mut kv_cache = KvCache::new(KvCacheConfig {
+            num_layers: 1,
+            num_kv_heads: 1,
+            head_dim: 2,
+            max_sequence_length: 8,
+            dtype: DType::F32,
+        })
+        .unwrap();
+        let mut last_logits = None;
+
+        for (position, token_id) in [0u32, 1u32].iter().copied().enumerate() {
+            let logits = decoder_model_token_logits_with_kv_cache_f32(
+                &model,
+                token_id,
+                &mut kv_cache,
+                position,
+            )
+            .unwrap();
+            kv_cache.advance(1).unwrap();
+            last_logits = Some(logits);
+        }
+
+        let last_logits = last_logits.unwrap();
+        let full_last_logits = decoder_model_last_token_logits_f32(&model, &[0, 1]).unwrap();
+
+        approx_eq_slice(
+            &last_logits.to_vec_f32().unwrap(),
+            &full_last_logits.to_vec_f32().unwrap(),
+            1e-5,
+        );
+        assert_eq!(kv_cache.used_tokens(), 2);
+    }
+
+    #[test]
+    fn decoder_model_token_sample_with_kv_cache_matches_logits_argmax() {
+        let model = tiny_reference_model();
+        let mut kv_cache = KvCache::new(KvCacheConfig {
+            num_layers: 1,
+            num_kv_heads: 1,
+            head_dim: 2,
+            max_sequence_length: 8,
+            dtype: DType::F32,
+        })
+        .unwrap();
+        let mut last_sample = None;
+        let mut last_logits = None;
+
+        for (position, token_id) in [0u32, 1u32].iter().copied().enumerate() {
+            let sample =
+                decoder_model_token_sample_with_kv_cache_f32(&model, token_id, &mut kv_cache, position)
+                    .unwrap();
+            let logits = decoder_model_token_logits_with_kv_cache_f32(
+                &model,
+                token_id,
+                &mut kv_cache,
+                position,
+            )
+            .unwrap();
+            kv_cache.advance(1).unwrap();
+            last_sample = Some(sample);
+            last_logits = Some(logits);
+        }
+
+        let sample = last_sample.unwrap();
+        let logits = last_logits.unwrap();
+        let expected = crate::sampler::argmax_last_token(&logits).unwrap();
+
+        assert_eq!(sample.token_id, expected.token_id);
+        assert!((sample.probability - expected.probability).abs() <= 1e-6);
+    }
+
+    #[test]
+    fn decoder_model_prefill_last_token_logits_with_kv_cache_matches_full_forward_last_row() {
+        let model = tiny_reference_model();
+        let mut kv_cache = KvCache::new(KvCacheConfig {
+            num_layers: 1,
+            num_kv_heads: 1,
+            head_dim: 2,
+            max_sequence_length: 8,
+            dtype: DType::F32,
+        })
+        .unwrap();
+
+        let logits =
+            decoder_model_prefill_last_token_logits_with_kv_cache_f32(&model, &[0, 1], &mut kv_cache)
+                .unwrap();
+        kv_cache.advance(2).unwrap();
+        let full_last_logits = decoder_model_last_token_logits_f32(&model, &[0, 1]).unwrap();
+
+        approx_eq_slice(
+            &logits.to_vec_f32().unwrap(),
+            &full_last_logits.to_vec_f32().unwrap(),
+            1e-5,
+        );
+        assert_eq!(kv_cache.used_tokens(), 2);
+    }
+
+    #[test]
+    fn decoder_model_prefill_last_token_sample_with_kv_cache_matches_logits_argmax() {
+        let model = tiny_reference_model();
+        let mut sample_cache = KvCache::new(KvCacheConfig {
+            num_layers: 1,
+            num_kv_heads: 1,
+            head_dim: 2,
+            max_sequence_length: 8,
+            dtype: DType::F32,
+        })
+        .unwrap();
+        let mut logits_cache = KvCache::new(KvCacheConfig {
+            num_layers: 1,
+            num_kv_heads: 1,
+            head_dim: 2,
+            max_sequence_length: 8,
+            dtype: DType::F32,
+        })
+        .unwrap();
+
+        let sample =
+            decoder_model_prefill_last_token_sample_with_kv_cache_f32(&model, &[0, 1], &mut sample_cache)
+                .unwrap();
+        let logits =
+            decoder_model_prefill_last_token_logits_with_kv_cache_f32(&model, &[0, 1], &mut logits_cache)
+                .unwrap();
+        let expected = crate::sampler::argmax_last_token(&logits).unwrap();
+
+        assert_eq!(sample.token_id, expected.token_id);
+        assert!((sample.probability - expected.probability).abs() <= 1e-6);
     }
 
     fn tiny_reference_model() -> DecoderOnlyModel {
