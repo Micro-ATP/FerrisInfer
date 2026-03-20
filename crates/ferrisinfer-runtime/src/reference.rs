@@ -1,6 +1,7 @@
 use ferrisinfer_core::{DType, ErrorKind, FerrisError, Result, Shape, Tensor};
 use ferrisinfer_kernel::cpu::attention::{
-    causal_self_attention_f32, decode_causal_attention_f32, embedding_gather_f32, rope_f32,
+    cached_prefixed_causal_attention_f32, causal_self_attention_f32, decode_causal_attention_f32,
+    embedding_gather_f32, rope_f32,
 };
 use ferrisinfer_kernel::cpu::elementwise::{add_f32_in_place, mul_f32_in_place, silu_f32_in_place};
 use ferrisinfer_kernel::cpu::matmul::{
@@ -42,6 +43,33 @@ pub struct ReferenceBlockConfig {
     pub rotary_dims: usize,
 }
 
+pub(crate) struct PrefillWorkspace {
+    normed: Tensor,
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    attention: Tensor,
+    gated_product: Tensor,
+    gate_projection: Tensor,
+}
+
+impl PrefillWorkspace {
+    fn for_block(config: ReferenceBlockConfig, seq_len: usize) -> Result<Self> {
+        let hidden_size = config.num_heads * config.head_dim;
+        let kv_hidden_size = config.num_kv_heads * config.head_dim;
+
+        Ok(Self {
+            normed: zeros_2d(seq_len, hidden_size)?,
+            query: zeros_2d(seq_len, hidden_size)?,
+            key: zeros_2d(seq_len, kv_hidden_size)?,
+            value: zeros_2d(seq_len, kv_hidden_size)?,
+            attention: zeros_2d(seq_len, hidden_size)?,
+            gated_product: zeros_2d(seq_len, config.intermediate_size)?,
+            gate_projection: zeros_2d(seq_len, config.intermediate_size)?,
+        })
+    }
+}
+
 pub(crate) struct DecodeWorkspace {
     hidden: Tensor,
     normed: Tensor,
@@ -76,13 +104,34 @@ impl DecodeWorkspace {
         &self.logits
     }
 }
-
 pub fn decoder_block_forward_f32(
     input: &Tensor,
     weights: &ReferenceDecoderBlockWeights<'_>,
     config: ReferenceBlockConfig,
 ) -> Result<Tensor> {
-    let (output, _, _) = decoder_block_forward_with_kv_capture_f32(input, weights, config, 0)?;
+    input.ensure_dtype(DType::F32)?;
+    input.ensure_contiguous()?;
+
+    if input.shape().rank() != 2 {
+        return Err(FerrisError::new(
+            ErrorKind::InvalidShape,
+            "decoder block input must have shape [seq_len, hidden_size]",
+        ));
+    }
+
+    let seq_len = input.shape().dims()[0];
+    let hidden_size = config.num_heads * config.head_dim;
+    let mut output = zeros_2d(seq_len, hidden_size)?;
+    let mut workspace = PrefillWorkspace::for_block(config, seq_len)?;
+    decoder_block_forward_buffered_f32(
+        input,
+        &mut output,
+        weights,
+        config,
+        0,
+        None,
+        &mut workspace,
+    )?;
     Ok(output)
 }
 
@@ -92,53 +141,11 @@ pub(crate) fn decoder_model_prefill_last_token_logits_with_kv_cache_f32(
     token_ids: &[u32],
     kv_cache: &mut KvCache,
 ) -> Result<Tensor> {
-    validate_supported_reference_model(model.config())?;
-
-    if token_ids.is_empty() {
-        return Err(FerrisError::new(
-            ErrorKind::InvalidShape,
-            "prefill reference path requires at least one token",
-        ));
-    }
-
-    if kv_cache.used_tokens() != 0 {
-        return Err(FerrisError::new(
-            ErrorKind::Runtime,
-            "batch prefill requires an empty KV cache",
-        ));
-    }
-
-    if token_ids.len() > kv_cache.remaining_tokens() {
-        return Err(FerrisError::new(
-            ErrorKind::Runtime,
-            "batch prefill exceeds KV cache capacity",
-        ));
-    }
-
-    let config = model.config();
-    let embedding = get_weight(model, "tok_embeddings.weight")?;
-    let mut hidden = zeros_2d(token_ids.len(), config.hidden_size)?;
-    embedding_gather_f32(embedding, token_ids, &mut hidden)?;
-
-    for layer in 0..config.num_layers {
-        let weights = block_weights(model, layer)?;
-        let (next_hidden, key_heads, value_heads) =
-            decoder_block_forward_with_kv_capture_f32(&hidden, &weights, block_config(config), 0)?;
-        kv_cache.write_sequence_uncommitted_f32(layer, 0, &key_heads, &value_heads)?;
-        hidden = next_hidden;
-    }
-
-    let mut normalized = zeros_2d(token_ids.len(), config.hidden_size)?;
-    rms_norm_f32(
-        &hidden,
-        get_weight(model, "norm.weight")?,
-        &mut normalized,
-        config.norm.epsilon,
-    )?;
-
+    let normalized = decoder_model_prefill_hidden_with_kv_capture_f32(model, token_ids, kv_cache)?;
     let last_hidden = select_last_row_f32(&normalized)?;
     let output_weight = output_weight(model)?;
-    let mut logits = zeros_2d(1, config.vocab_size)?;
+
+    let mut logits = zeros_2d(1, model.config().vocab_size)?;
     linear_right_transposed_f32(&last_hidden, output_weight, &mut logits)?;
     Ok(logits)
 }
@@ -148,67 +155,29 @@ pub(crate) fn decoder_model_prefill_last_token_sample_with_kv_cache_f32(
     token_ids: &[u32],
     kv_cache: &mut KvCache,
 ) -> Result<TokenSample> {
-    validate_supported_reference_model(model.config())?;
-
-    if token_ids.is_empty() {
-        return Err(FerrisError::new(
-            ErrorKind::InvalidShape,
-            "prefill reference path requires at least one token",
-        ));
-    }
-
-    if kv_cache.used_tokens() != 0 {
-        return Err(FerrisError::new(
-            ErrorKind::Runtime,
-            "batch prefill requires an empty KV cache",
-        ));
-    }
-
-    if token_ids.len() > kv_cache.remaining_tokens() {
-        return Err(FerrisError::new(
-            ErrorKind::Runtime,
-            "batch prefill exceeds KV cache capacity",
-        ));
-    }
-
-    let config = model.config();
-    let embedding = get_weight(model, "tok_embeddings.weight")?;
-    let mut hidden = zeros_2d(token_ids.len(), config.hidden_size)?;
-    embedding_gather_f32(embedding, token_ids, &mut hidden)?;
-
-    for layer in 0..config.num_layers {
-        let weights = block_weights(model, layer)?;
-        let (next_hidden, key_heads, value_heads) =
-            decoder_block_forward_with_kv_capture_f32(&hidden, &weights, block_config(config), 0)?;
-        kv_cache.write_sequence_uncommitted_f32(layer, 0, &key_heads, &value_heads)?;
-        hidden = next_hidden;
-    }
-
-    let mut normalized = zeros_2d(token_ids.len(), config.hidden_size)?;
-    rms_norm_f32(
-        &hidden,
-        get_weight(model, "norm.weight")?,
-        &mut normalized,
-        config.norm.epsilon,
-    )?;
-
+    let normalized = decoder_model_prefill_hidden_with_kv_capture_f32(model, token_ids, kv_cache)?;
     let last_hidden = select_last_row_f32(&normalized)?;
     linear_right_transposed_argmax_f32(&last_hidden, output_weight(model)?)
 }
 
-fn decoder_block_forward_with_kv_capture_f32(
+fn decoder_block_forward_buffered_f32(
     input: &Tensor,
+    output: &mut Tensor,
     weights: &ReferenceDecoderBlockWeights<'_>,
     config: ReferenceBlockConfig,
     position_offset: usize,
-) -> Result<(Tensor, Tensor, Tensor)> {
+    kv_capture: Option<(&mut KvCache, usize, usize)>,
+    workspace: &mut PrefillWorkspace,
+) -> Result<()> {
     input.ensure_dtype(DType::F32)?;
     input.ensure_contiguous()?;
+    output.ensure_dtype(DType::F32)?;
+    output.ensure_contiguous()?;
 
-    if input.shape().rank() != 2 {
+    if input.shape().rank() != 2 || output.shape().rank() != 2 {
         return Err(FerrisError::new(
             ErrorKind::InvalidShape,
-            "decoder block input must have shape [seq_len, hidden_size]",
+            "decoder block forward requires rank-2 input and output tensors",
         ));
     }
 
@@ -243,78 +212,225 @@ fn decoder_block_forward_with_kv_capture_f32(
         ));
     }
 
-    let mut normed = zeros_2d(seq_len, hidden_size)?;
+    if output.shape().dims() != [seq_len, hidden_size] {
+        return Err(FerrisError::new(
+            ErrorKind::InvalidShape,
+            "decoder block output must have shape [seq_len, hidden_size]",
+        ));
+    }
+
+    workspace
+        .normed
+        .reshape_in_place(Shape::from_slice(&[seq_len, hidden_size])?)?;
+    workspace
+        .query
+        .reshape_in_place(Shape::from_slice(&[seq_len, hidden_size])?)?;
+    workspace
+        .key
+        .reshape_in_place(Shape::from_slice(&[seq_len, kv_hidden_size])?)?;
+    workspace
+        .value
+        .reshape_in_place(Shape::from_slice(&[seq_len, kv_hidden_size])?)?;
+    workspace
+        .attention
+        .reshape_in_place(Shape::from_slice(&[seq_len, hidden_size])?)?;
+    workspace
+        .gated_product
+        .reshape_in_place(Shape::from_slice(&[seq_len, config.intermediate_size])?)?;
+    workspace
+        .gate_projection
+        .reshape_in_place(Shape::from_slice(&[seq_len, config.intermediate_size])?)?;
+
     rms_norm_f32(
         input,
         weights.attention_norm,
-        &mut normed,
+        &mut workspace.normed,
         config.rms_norm_epsilon,
     )?;
 
-    let mut query = zeros_2d(seq_len, query_hidden_size)?;
-    let mut key = zeros_2d(seq_len, kv_hidden_size)?;
-    let mut value = zeros_2d(seq_len, kv_hidden_size)?;
-    linear_f32_with_bias(&normed, weights.wq, weights.wq_bias, &mut query)?;
-    linear_f32_with_bias(&normed, weights.wk, weights.wk_bias, &mut key)?;
-    linear_f32_with_bias(&normed, weights.wv, weights.wv_bias, &mut value)?;
+    linear_f32_with_bias(
+        &workspace.normed,
+        weights.wq,
+        weights.wq_bias,
+        &mut workspace.query,
+    )?;
+    linear_f32_with_bias(
+        &workspace.normed,
+        weights.wk,
+        weights.wk_bias,
+        &mut workspace.key,
+    )?;
+    linear_f32_with_bias(
+        &workspace.normed,
+        weights.wv,
+        weights.wv_bias,
+        &mut workspace.value,
+    )?;
 
-    let mut query_heads =
-        reshape_heads_2d_to_3d(query, seq_len, config.num_heads, config.head_dim)?;
-    let mut key_heads = reshape_heads_2d_to_3d(key, seq_len, config.num_kv_heads, config.head_dim)?;
-    let value_heads = reshape_heads_2d_to_3d(value, seq_len, config.num_kv_heads, config.head_dim)?;
+    workspace.query.reshape_in_place(Shape::from_slice(&[
+        seq_len,
+        config.num_heads,
+        config.head_dim,
+    ])?)?;
+    workspace.key.reshape_in_place(Shape::from_slice(&[
+        seq_len,
+        config.num_kv_heads,
+        config.head_dim,
+    ])?)?;
+    workspace.value.reshape_in_place(Shape::from_slice(&[
+        seq_len,
+        config.num_kv_heads,
+        config.head_dim,
+    ])?)?;
+    workspace.attention.reshape_in_place(Shape::from_slice(&[
+        seq_len,
+        config.num_heads,
+        config.head_dim,
+    ])?)?;
 
     rope_f32(
-        &mut query_heads,
-        &mut key_heads,
+        &mut workspace.query,
+        &mut workspace.key,
         position_offset,
         config.rotary_dims,
         config.rope_theta,
     )?;
 
-    let mut attention_heads = zeros_3d(seq_len, config.num_heads, config.head_dim)?;
-    causal_self_attention_f32(&query_heads, &key_heads, &value_heads, &mut attention_heads)?;
+    match kv_capture {
+        Some((kv_cache, layer_index, start_position)) => {
+            if start_position == 0 {
+                causal_self_attention_f32(
+                    &workspace.query,
+                    &workspace.key,
+                    &workspace.value,
+                    &mut workspace.attention,
+                )?;
+            } else {
+                let cache_layer = kv_cache.layer(layer_index)?;
+                cached_prefixed_causal_attention_f32(
+                    &workspace.query,
+                    cache_layer.key(),
+                    cache_layer.value(),
+                    start_position,
+                    &workspace.key,
+                    &workspace.value,
+                    &mut workspace.attention,
+                )?;
+            }
 
-    let attention_merged = reshape_heads_3d_to_2d(attention_heads, seq_len, hidden_size)?;
+            kv_cache.write_sequence_uncommitted_f32(
+                layer_index,
+                start_position,
+                &workspace.key,
+                &workspace.value,
+            )?;
+        }
+        None => {
+            causal_self_attention_f32(
+                &workspace.query,
+                &workspace.key,
+                &workspace.value,
+                &mut workspace.attention,
+            )?;
+        }
+    }
+    workspace
+        .attention
+        .reshape_in_place(Shape::from_slice(&[seq_len, hidden_size])?)?;
 
-    let mut attention_projected = normed;
     linear_f32_with_bias(
-        &attention_merged,
+        &workspace.attention,
         weights.wo,
         weights.wo_bias,
-        &mut attention_projected,
+        &mut workspace.normed,
     )?;
+    add_f32_in_place(&mut workspace.normed, input)?;
 
-    let mut residual = attention_projected;
-    add_f32_in_place(&mut residual, input)?;
-
-    let mut ffn_input = attention_merged;
     rms_norm_f32(
-        &residual,
+        &workspace.normed,
         weights.ffn_norm,
-        &mut ffn_input,
+        &mut workspace.attention,
         config.rms_norm_epsilon,
     )?;
 
-    let mut gated_product = zeros_2d(seq_len, config.intermediate_size)?;
-    let mut gate_projection = zeros_2d(seq_len, config.intermediate_size)?;
-    linear_f32_with_bias(&ffn_input, weights.w1, weights.w1_bias, &mut gated_product)?;
     linear_f32_with_bias(
-        &ffn_input,
+        &workspace.attention,
+        weights.w1,
+        weights.w1_bias,
+        &mut workspace.gated_product,
+    )?;
+    linear_f32_with_bias(
+        &workspace.attention,
         weights.w3,
         weights.w3_bias,
-        &mut gate_projection,
+        &mut workspace.gate_projection,
     )?;
 
-    silu_f32_in_place(&mut gate_projection)?;
-    mul_f32_in_place(&mut gated_product, &gate_projection)?;
+    silu_f32_in_place(&mut workspace.gate_projection)?;
+    mul_f32_in_place(&mut workspace.gated_product, &workspace.gate_projection)?;
 
-    let mut mlp_output = ffn_input;
-    linear_f32_with_bias(&gated_product, weights.w2, weights.w2_bias, &mut mlp_output)?;
-
-    add_f32_in_place(&mut mlp_output, &residual)?;
-    Ok((mlp_output, key_heads, value_heads))
+    linear_f32_with_bias(
+        &workspace.gated_product,
+        weights.w2,
+        weights.w2_bias,
+        output,
+    )?;
+    add_f32_in_place(output, &workspace.normed)?;
+    Ok(())
 }
 
+fn decoder_model_prefill_hidden_with_kv_capture_f32(
+    model: &DecoderOnlyModel,
+    token_ids: &[u32],
+    kv_cache: &mut KvCache,
+) -> Result<Tensor> {
+    validate_supported_reference_model(model.config())?;
+
+    if token_ids.is_empty() {
+        return Err(FerrisError::new(
+            ErrorKind::InvalidShape,
+            "prefill reference path requires at least one token",
+        ));
+    }
+
+    if token_ids.len() > kv_cache.remaining_tokens() {
+        return Err(FerrisError::new(
+            ErrorKind::Runtime,
+            "batch prefill exceeds KV cache capacity",
+        ));
+    }
+
+    let config = model.config();
+    let block = block_config(config);
+    let start_position = kv_cache.used_tokens();
+    let embedding = get_weight(model, "tok_embeddings.weight")?;
+    let mut hidden = zeros_2d(token_ids.len(), config.hidden_size)?;
+    embedding_gather_f32(embedding, token_ids, &mut hidden)?;
+    let mut next_hidden = zeros_2d(token_ids.len(), config.hidden_size)?;
+    let mut workspace = PrefillWorkspace::for_block(block, token_ids.len())?;
+
+    for layer in 0..config.num_layers {
+        let weights = block_weights(model, layer)?;
+        decoder_block_forward_buffered_f32(
+            &hidden,
+            &mut next_hidden,
+            &weights,
+            block,
+            start_position,
+            Some((kv_cache, layer, start_position)),
+            &mut workspace,
+        )?;
+        std::mem::swap(&mut hidden, &mut next_hidden);
+    }
+
+    rms_norm_f32(
+        &hidden,
+        get_weight(model, "norm.weight")?,
+        &mut next_hidden,
+        config.norm.epsilon,
+    )?;
+    Ok(next_hidden)
+}
 pub fn decoder_model_forward_f32(model: &DecoderOnlyModel, token_ids: &[u32]) -> Result<Tensor> {
     let normalized = decoder_model_hidden_f32(model, token_ids)?;
     let output_weight = output_weight(model)?;
@@ -382,11 +498,7 @@ pub(crate) fn decoder_model_token_logits_with_kv_cache_buffered_f32(
 
     let config = model.config();
     decoder_model_token_hidden_with_kv_cache_buffered_f32(
-        model,
-        token_id,
-        kv_cache,
-        position,
-        workspace,
+        model, token_id, kv_cache, position, workspace,
     )?;
 
     rms_norm_f32(
@@ -413,11 +525,7 @@ pub(crate) fn decoder_model_token_sample_with_kv_cache_buffered_f32(
 
     let config = model.config();
     decoder_model_token_hidden_with_kv_cache_buffered_f32(
-        model,
-        token_id,
-        kv_cache,
-        position,
-        workspace,
+        model, token_id, kv_cache, position, workspace,
     )?;
 
     rms_norm_f32(
@@ -441,25 +549,35 @@ fn decoder_model_hidden_f32(model: &DecoderOnlyModel, token_ids: &[u32]) -> Resu
     }
 
     let config = model.config();
+    let block = block_config(config);
     let embedding = get_weight(model, "tok_embeddings.weight")?;
     let mut hidden = zeros_2d(token_ids.len(), config.hidden_size)?;
     embedding_gather_f32(embedding, token_ids, &mut hidden)?;
+    let mut next_hidden = zeros_2d(token_ids.len(), config.hidden_size)?;
+    let mut workspace = PrefillWorkspace::for_block(block, token_ids.len())?;
 
     for layer in 0..config.num_layers {
         let weights = block_weights(model, layer)?;
-        hidden = decoder_block_forward_f32(&hidden, &weights, block_config(config))?;
+        decoder_block_forward_buffered_f32(
+            &hidden,
+            &mut next_hidden,
+            &weights,
+            block,
+            0,
+            None,
+            &mut workspace,
+        )?;
+        std::mem::swap(&mut hidden, &mut next_hidden);
     }
 
-    let mut normalized = zeros_2d(token_ids.len(), config.hidden_size)?;
     rms_norm_f32(
         &hidden,
         get_weight(model, "norm.weight")?,
-        &mut normalized,
+        &mut next_hidden,
         config.norm.epsilon,
     )?;
-    Ok(normalized)
+    Ok(next_hidden)
 }
-
 fn decoder_model_token_hidden_with_kv_cache_buffered_f32(
     model: &DecoderOnlyModel,
     token_id: u32,
@@ -471,9 +589,15 @@ fn decoder_model_token_hidden_with_kv_cache_buffered_f32(
     let hidden_size = config.hidden_size;
     let kv_hidden_size = config.num_key_value_heads * config.head_dim();
 
-    workspace.hidden.reshape_in_place(Shape::from_slice(&[1, hidden_size])?)?;
-    workspace.normed.reshape_in_place(Shape::from_slice(&[1, hidden_size])?)?;
-    workspace.query.reshape_in_place(Shape::from_slice(&[1, hidden_size])?)?;
+    workspace
+        .hidden
+        .reshape_in_place(Shape::from_slice(&[1, hidden_size])?)?;
+    workspace
+        .normed
+        .reshape_in_place(Shape::from_slice(&[1, hidden_size])?)?;
+    workspace
+        .query
+        .reshape_in_place(Shape::from_slice(&[1, hidden_size])?)?;
     workspace
         .key
         .reshape_in_place(Shape::from_slice(&[1, kv_hidden_size])?)?;
@@ -522,7 +646,9 @@ fn decoder_block_decode_step_buffered_f32(
         ));
     }
 
-    workspace.normed.reshape_in_place(Shape::from_slice(&[1, hidden_size])?)?;
+    workspace
+        .normed
+        .reshape_in_place(Shape::from_slice(&[1, hidden_size])?)?;
     rms_norm_f32(
         &workspace.hidden,
         weights.attention_norm,
@@ -530,7 +656,9 @@ fn decoder_block_decode_step_buffered_f32(
         config.rms_norm_epsilon,
     )?;
 
-    workspace.query.reshape_in_place(Shape::from_slice(&[1, hidden_size])?)?;
+    workspace
+        .query
+        .reshape_in_place(Shape::from_slice(&[1, hidden_size])?)?;
     workspace
         .key
         .reshape_in_place(Shape::from_slice(&[1, kv_hidden_size])?)?;
@@ -556,15 +684,21 @@ fn decoder_block_decode_step_buffered_f32(
         &mut workspace.value,
     )?;
 
-    workspace
-        .query
-        .reshape_in_place(Shape::from_slice(&[1, config.num_heads, config.head_dim])?)?;
-    workspace
-        .key
-        .reshape_in_place(Shape::from_slice(&[1, config.num_kv_heads, config.head_dim])?)?;
-    workspace
-        .value
-        .reshape_in_place(Shape::from_slice(&[1, config.num_kv_heads, config.head_dim])?)?;
+    workspace.query.reshape_in_place(Shape::from_slice(&[
+        1,
+        config.num_heads,
+        config.head_dim,
+    ])?)?;
+    workspace.key.reshape_in_place(Shape::from_slice(&[
+        1,
+        config.num_kv_heads,
+        config.head_dim,
+    ])?)?;
+    workspace.value.reshape_in_place(Shape::from_slice(&[
+        1,
+        config.num_kv_heads,
+        config.head_dim,
+    ])?)?;
     rope_f32(
         &mut workspace.query,
         &mut workspace.key,
@@ -581,9 +715,11 @@ fn decoder_block_decode_step_buffered_f32(
         .reshape_in_place(Shape::from_slice(&[config.num_kv_heads, config.head_dim])?)?;
 
     let cache_layer = kv_cache.layer(layer_index)?;
-    workspace
-        .attention
-        .reshape_in_place(Shape::from_slice(&[1, config.num_heads, config.head_dim])?)?;
+    workspace.attention.reshape_in_place(Shape::from_slice(&[
+        1,
+        config.num_heads,
+        config.head_dim,
+    ])?)?;
     decode_causal_attention_f32(
         &workspace.query,
         cache_layer.key(),
@@ -645,7 +781,9 @@ fn decoder_block_decode_step_buffered_f32(
     silu_f32_in_place(&mut workspace.gate_projection)?;
     mul_f32_in_place(&mut workspace.gated_product, &workspace.gate_projection)?;
 
-    workspace.hidden.reshape_in_place(Shape::from_slice(&[1, hidden_size])?)?;
+    workspace
+        .hidden
+        .reshape_in_place(Shape::from_slice(&[1, hidden_size])?)?;
     linear_f32_with_bias(
         &workspace.gated_product,
         weights.w2,
@@ -1342,6 +1480,37 @@ mod tests {
             1e-5,
         );
         assert_eq!(kv_cache.used_tokens(), 2);
+    }
+    #[test]
+    fn decoder_model_prefill_last_token_logits_with_existing_kv_matches_full_forward_last_row() {
+        let model = tiny_reference_model();
+        let mut kv_cache = KvCache::new(KvCacheConfig {
+            num_layers: 1,
+            num_kv_heads: 1,
+            head_dim: 2,
+            max_sequence_length: 8,
+            dtype: DType::F32,
+        })
+        .unwrap();
+
+        let _ = decoder_model_token_logits_with_kv_cache_f32(&model, 0, &mut kv_cache, 0).unwrap();
+        kv_cache.advance(1).unwrap();
+
+        let logits = decoder_model_prefill_last_token_logits_with_kv_cache_f32(
+            &model,
+            &[1, 0],
+            &mut kv_cache,
+        )
+        .unwrap();
+        kv_cache.advance(2).unwrap();
+        let full_last_logits = decoder_model_last_token_logits_f32(&model, &[0, 1, 0]).unwrap();
+
+        approx_eq_slice(
+            &logits.to_vec_f32().unwrap(),
+            &full_last_logits.to_vec_f32().unwrap(),
+            1e-5,
+        );
+        assert_eq!(kv_cache.used_tokens(), 3);
     }
 
     #[test]

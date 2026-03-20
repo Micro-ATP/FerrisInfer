@@ -89,6 +89,11 @@ pub fn matmul_f32(lhs: &Tensor, rhs: &Tensor, out: &mut Tensor) -> Result<()> {
         return Ok(());
     }
 
+    if m == 1 {
+        compute_single_row_matmul(lhs_values, rhs_values, out_values, n);
+        return Ok(());
+    }
+
     out_values.fill(0.0);
     let thread_count = preferred_thread_count(m, n, k);
 
@@ -442,6 +447,57 @@ fn compute_row_chunk(
     }
 }
 
+fn compute_single_row_matmul(
+    lhs_values: &[f32],
+    rhs_values: &[f32],
+    out_values: &mut [f32],
+    cols: usize,
+) {
+    let thread_count = preferred_single_row_thread_count(cols, lhs_values.len());
+    if thread_count == 1 {
+        compute_single_row_chunk(lhs_values, rhs_values, out_values, cols, 0, cols);
+        return;
+    }
+
+    let cols_per_chunk = cols.div_ceil(thread_count);
+    std::thread::scope(|scope| {
+        for (chunk_index, out_chunk) in out_values.chunks_mut(cols_per_chunk).enumerate() {
+            let col_start = chunk_index * cols_per_chunk;
+            let col_end = (col_start + cols_per_chunk).min(cols);
+            let lhs_values = &lhs_values;
+            let rhs_values = &rhs_values;
+
+            scope.spawn(move || {
+                compute_single_row_chunk(
+                    lhs_values, rhs_values, out_chunk, cols, col_start, col_end,
+                );
+            });
+        }
+    });
+}
+
+fn compute_single_row_chunk(
+    lhs_values: &[f32],
+    rhs_values: &[f32],
+    out_chunk: &mut [f32],
+    total_cols: usize,
+    col_start: usize,
+    col_end: usize,
+) {
+    out_chunk.fill(0.0);
+
+    for (inner, lhs_value) in lhs_values.iter().copied().enumerate() {
+        if lhs_value == 0.0 {
+            continue;
+        }
+
+        let rhs_row = &rhs_values[inner * total_cols + col_start..inner * total_cols + col_end];
+        for (slot, rhs_value) in out_chunk.iter_mut().zip(rhs_row.iter().copied()) {
+            *slot += lhs_value * rhs_value;
+        }
+    }
+}
+
 fn compute_transposed_row_chunk(
     lhs_values: &[f32],
     rhs_values: &[f32],
@@ -532,6 +588,7 @@ fn merge_projection_argmax_chunks(
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn projection_argmax_from_logits(logits: &[f32]) -> ProjectionArgmax {
     debug_assert!(!logits.is_empty());
 
@@ -574,6 +631,24 @@ fn preferred_thread_count(rows: usize, cols: usize, inner: usize) -> usize {
 
     std::thread::available_parallelism()
         .map(|parallelism| parallelism.get().min(rows))
+        .unwrap_or(1)
+}
+
+fn preferred_single_row_thread_count(cols: usize, inner: usize) -> usize {
+    const MIN_PARALLEL_WORK: usize = 8_388_608;
+    const MIN_PARALLEL_COLS: usize = 8192;
+
+    if cols < MIN_PARALLEL_COLS {
+        return 1;
+    }
+
+    let total_work = cols.saturating_mul(inner);
+    if total_work < MIN_PARALLEL_WORK {
+        return 1;
+    }
+
+    std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get().min(cols))
         .unwrap_or(1)
 }
 

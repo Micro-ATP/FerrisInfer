@@ -7,11 +7,12 @@ use std::thread;
 use std::time::Instant;
 
 use ferrisinfer_io::{ChatMessage, HfSource, ModelSource, Tokenizer, VocabularyTokenizer};
-use ferrisinfer_kernel::{Backend, CpuBackend};
+use ferrisinfer_kernel::{Backend, CpuBackend, NvidiaCudaBackend, NvidiaCudaProbe};
 use ferrisinfer_model::DecoderOnlyModel;
 use ferrisinfer_runtime::{
     ExecutionMode, GenerationFinishReason, GenerationRequest, InferenceEngine, LoadedArtifacts,
-    SamplerConfig, Session, SessionConfig, TokenSample,
+    SamplerConfig, SchedulerBatchKind, SchedulerConfig, SequenceFinishReason, SequenceId,
+    SequenceSubmitRequest, Session, SessionConfig, SessionKvCacheConfig, TokenSample,
 };
 
 const DEFAULT_HF_PATH: &str = "models/Qwen2.5-0.5B-Instruct";
@@ -27,6 +28,7 @@ fn main() {
             print_plan(&engine, &SessionConfig::default());
             Ok(())
         }
+        Some("probe-cuda") => probe_cuda(),
         Some("inspect-hf") => inspect_hf(args.get(2).map(String::as_str)),
         Some("profile-hf-load") => profile_hf_load(args.get(2).map(String::as_str)),
         Some("profile-hf") => profile_hf(
@@ -38,6 +40,20 @@ fn main() {
             &engine,
             args.get(2).map(String::as_str),
             args.get(3).map(String::as_str),
+            default_short_system_prompt_path(),
+        ),
+        Some("profile-chat-hf") => profile_chat_hf(&engine, args.get(2).map(String::as_str)),
+        Some("profile-chat-hf-short") => profile_chat_hf_with_prompt(
+            &engine,
+            args.get(2).map(String::as_str),
+            default_short_system_prompt_path(),
+        ),
+        Some("profile-continuous-hf") => {
+            profile_continuous_hf(&engine, args.get(2).map(String::as_str))
+        }
+        Some("profile-continuous-hf-short") => profile_continuous_hf_with_prompt(
+            &engine,
+            args.get(2).map(String::as_str),
             default_short_system_prompt_path(),
         ),
         Some("chat-hf") => chat_hf(&engine, args.get(2).map(String::as_str)),
@@ -106,12 +122,17 @@ fn print_help() {
     println!("Commands:");
     println!("  help                           Show this message");
     println!("  plan                           Print the current implementation framework");
+    println!("  probe-cuda                     Probe the NVIDIA CUDA driver and enumerate devices");
     println!("  inspect-hf [path]              Inspect a local Hugging Face model directory");
     println!(
         "  profile-hf-load [path]         Measure config/tokenizer/weights/model load timings"
     );
     println!("  profile-hf [text] [tokens]     Measure load/session/prefill/decode timings");
     println!("  profile-hf-short [text] [tokens] Measure timings with docs/system_prompt_short.md");
+    println!("  profile-chat-hf [tokens]       Measure a built-in multi-turn chat benchmark");
+    println!("  profile-chat-hf-short [tokens] Measure the chat benchmark with docs/system_prompt_short.md");
+    println!("  profile-continuous-hf [tokens] Measure a built-in continuous batching benchmark");
+    println!("  profile-continuous-hf-short [tokens] Measure the benchmark with docs/system_prompt_short.md");
     println!("  chat-hf [tokens]               Start an interactive multi-turn chat session");
     println!("  chat-hf-greedy [tokens]        Start chat with greedy decoding");
     println!("  chat-hf-short [tokens]         Start chat with docs/system_prompt_short.md");
@@ -143,16 +164,95 @@ fn print_help() {
 fn print_plan(engine: &InferenceEngine<CpuBackend>, config: &SessionConfig) {
     let prefill = engine.build_plan(ExecutionMode::Prefill);
     let decode = engine.build_plan(ExecutionMode::Decode);
+    let capabilities = engine.backend().capabilities();
+    let availability = engine.backend().availability();
+    let nvidia_cuda = NvidiaCudaBackend::default();
+    let nvidia_cuda_probe = nvidia_cuda.probe();
 
     println!("FerrisInfer implementation framework");
     println!("backend: {}", engine.backend().name());
+    println!("device: {:?}", engine.backend().device());
+    println!(
+        "backend available: {}",
+        if availability.available { "yes" } else { "no" }
+    );
+    if let Some(reason) = availability.reason {
+        println!("backend availability note: {}", reason);
+    }
+    println!(
+        "backend capabilities: simd={} multithreaded={} quantized={} device_memory={} graph_capture={}",
+        capabilities.simd,
+        capabilities.multithreaded,
+        capabilities.quantized_kernels,
+        capabilities.device_memory,
+        capabilities.graph_capture,
+    );
+    print_nvidia_cuda_probe_summary(nvidia_cuda_probe);
     println!(
         "default max sequence length: {}",
         config.max_sequence_length
     );
+    println!("runtime scheduler: sequence state + reference scheduler available");
+    println!("runtime batching: continuous batching reference benchmark available");
+    println!("kv cache storage: contiguous default, paged prototype available");
+    println!("kv prefix reuse: paged block table + prefix handle + prefix index available");
+    println!("prefill scheduling: chunked prefill reference path available");
+    println!(
+        "batch scheduling: decode fairness + compaction + prefix-indexed prompt reuse available"
+    );
     println!("prefill steps: {}", prefill.steps.len());
     println!("decode steps: {}", decode.steps.len());
     println!("layers: core -> kernel -> model -> io -> runtime -> cli");
+}
+
+fn probe_cuda() -> Result<(), ()> {
+    let backend = NvidiaCudaBackend::default();
+    println!("FerrisInfer NVIDIA CUDA probe");
+    print_nvidia_cuda_probe(backend.probe());
+    Ok(())
+}
+
+fn print_nvidia_cuda_probe_summary(probe: &NvidiaCudaProbe) {
+    let availability = probe.availability();
+    println!(
+        "nvidia cuda backend available: {}",
+        if availability.available { "yes" } else { "no" }
+    );
+    if let Some(reason) = availability.reason {
+        println!("nvidia cuda availability note: {}", reason);
+    }
+    if let Some(detail) = probe.detail() {
+        println!("nvidia cuda detail: {}", detail);
+    }
+    if let Some(library) = probe.driver_library() {
+        println!("nvidia cuda driver library: {}", library);
+    }
+    if let Some(version) = probe.driver_version() {
+        println!(
+            "nvidia cuda driver version: {}.{}",
+            version.major(),
+            version.minor()
+        );
+    }
+    println!("nvidia cuda devices: {}", probe.devices().len());
+}
+
+fn print_nvidia_cuda_probe(probe: &NvidiaCudaProbe) {
+    print_nvidia_cuda_probe_summary(probe);
+    for device in probe.devices() {
+        println!(
+            "cuda:{} name={} cc={}.{} vram_mib={}",
+            device.ordinal(),
+            device.name(),
+            device.compute_capability_major(),
+            device.compute_capability_minor(),
+            bytes_to_mib(device.total_memory_bytes())
+        );
+    }
+}
+
+fn bytes_to_mib(bytes: u64) -> u64 {
+    bytes / (1024 * 1024)
 }
 
 fn inspect_hf(path: Option<&str>) -> Result<(), ()> {
@@ -579,6 +679,37 @@ fn stream_reference_tokens_with_fallback_stop(
     max_new_tokens: usize,
     stop_config: &ChatStopConfig,
 ) -> Result<(Vec<TokenSample>, String, GenerationFinishReason), ()> {
+    generate_reference_tokens_with_fallback_stop(
+        tokenizer,
+        session,
+        max_new_tokens,
+        stop_config,
+        true,
+    )
+}
+
+fn collect_reference_tokens_with_fallback_stop(
+    tokenizer: &VocabularyTokenizer,
+    session: &mut Session,
+    max_new_tokens: usize,
+    stop_config: &ChatStopConfig,
+) -> Result<(Vec<TokenSample>, String, GenerationFinishReason), ()> {
+    generate_reference_tokens_with_fallback_stop(
+        tokenizer,
+        session,
+        max_new_tokens,
+        stop_config,
+        false,
+    )
+}
+
+fn generate_reference_tokens_with_fallback_stop(
+    tokenizer: &VocabularyTokenizer,
+    session: &mut Session,
+    max_new_tokens: usize,
+    stop_config: &ChatStopConfig,
+    stream_output: bool,
+) -> Result<(Vec<TokenSample>, String, GenerationFinishReason), ()> {
     let generation_budget = max_new_tokens.min(session.config().max_generated_tokens);
     let mut generated_tokens = Vec::with_capacity(generation_budget);
     let mut displayed_text = String::new();
@@ -605,11 +736,26 @@ fn stream_reference_tokens_with_fallback_stop(
             break;
         }
 
-        let token_bytes = tokenizer.decode_token_bytes(sample.token_id).map_err(|error| {
-            eprintln!("failed to decode assistant token bytes: {}", error);
-        })?;
+        let token_bytes = tokenizer
+            .decode_token_bytes(sample.token_id)
+            .map_err(|error| {
+                eprintln!("failed to decode assistant token bytes: {}", error);
+            })?;
         pending_bytes.extend_from_slice(&token_bytes);
-        flush_streamable_utf8(&mut pending_bytes, &mut displayed_text)?;
+        flush_streamable_utf8(&mut pending_bytes, &mut displayed_text, stream_output)?;
+    }
+
+    if !pending_bytes.is_empty() {
+        let tail = String::from_utf8(pending_bytes).map_err(|error| {
+            eprintln!("assistant stream decode failed: {}", error);
+        })?;
+        if stream_output {
+            print!("{tail}");
+            io::stdout().flush().map_err(|error| {
+                eprintln!("failed to flush stdout: {}", error);
+            })?;
+        }
+        displayed_text.push_str(&tail);
     }
 
     Ok((generated_tokens, displayed_text, finish_reason))
@@ -624,7 +770,11 @@ fn is_chat_stop_token(token_id: u32, stop_config: &ChatStopConfig) -> bool {
             .is_some_and(|stop| stop == token_id)
 }
 
-fn flush_streamable_utf8(pending_bytes: &mut Vec<u8>, displayed_text: &mut String) -> Result<(), ()> {
+fn flush_streamable_utf8(
+    pending_bytes: &mut Vec<u8>,
+    displayed_text: &mut String,
+    stream_output: bool,
+) -> Result<(), ()> {
     let delta = take_valid_utf8_prefix(pending_bytes).map_err(|error| {
         eprintln!("assistant stream decode failed: {}", error);
     })?;
@@ -632,10 +782,12 @@ fn flush_streamable_utf8(pending_bytes: &mut Vec<u8>, displayed_text: &mut Strin
         return Ok(());
     }
 
-    print!("{delta}");
-    io::stdout().flush().map_err(|error| {
-        eprintln!("failed to flush stdout: {}", error);
-    })?;
+    if stream_output {
+        print!("{delta}");
+        io::stdout().flush().map_err(|error| {
+            eprintln!("failed to flush stdout: {}", error);
+        })?;
+    }
     displayed_text.push_str(&delta);
     Ok(())
 }
@@ -658,8 +810,9 @@ fn take_valid_utf8_prefix(bytes: &mut Vec<u8>) -> Result<String, String> {
             }
 
             let prefix_bytes = bytes.drain(..valid_up_to).collect::<Vec<_>>();
-            String::from_utf8(prefix_bytes)
-                .map_err(|utf8_error| format!("valid UTF-8 prefix could not be reconstructed: {utf8_error}"))
+            String::from_utf8(prefix_bytes).map_err(|utf8_error| {
+                format!("valid UTF-8 prefix could not be reconstructed: {utf8_error}")
+            })
         }
         Err(error) => Err(format!(
             "invalid UTF-8 sequence while streaming assistant output at byte {}",
@@ -870,6 +1023,767 @@ fn profile_hf_with_prompt(
         preview_text(&report.generated_text, 240)
     );
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct ScriptedChatTurnProfile {
+    turn_index: usize,
+    user_text: String,
+    assistant_text: String,
+    report: ChatTurnReport,
+}
+
+struct ScriptedChatProfileReport {
+    turns: Vec<ScriptedChatTurnProfile>,
+    load_elapsed: std::time::Duration,
+    session_create_elapsed: std::time::Duration,
+    total_elapsed: std::time::Duration,
+}
+
+fn profile_chat_hf(
+    engine: &InferenceEngine<CpuBackend>,
+    max_new_tokens: Option<&str>,
+) -> Result<(), ()> {
+    profile_chat_hf_with_prompt(engine, max_new_tokens, default_system_prompt_path())
+}
+
+fn profile_chat_hf_with_prompt(
+    engine: &InferenceEngine<CpuBackend>,
+    max_new_tokens: Option<&str>,
+    system_prompt_path: &str,
+) -> Result<(), ()> {
+    warn_if_debug_profile();
+    let max_new_tokens = parse_max_new_tokens(max_new_tokens, 16)?;
+    let report = run_scripted_chat_profile(engine, max_new_tokens, system_prompt_path)?;
+    let total_reused_prompt_tokens = report
+        .turns
+        .iter()
+        .map(|turn| turn.report.reused_prompt_tokens)
+        .sum::<usize>();
+    let total_appended_prompt_tokens = report
+        .turns
+        .iter()
+        .map(|turn| turn.report.appended_prompt_tokens)
+        .sum::<usize>();
+    let total_generated_tokens = report
+        .turns
+        .iter()
+        .map(|turn| turn.report.generated_tokens)
+        .sum::<usize>();
+    let total_render_elapsed = report
+        .turns
+        .iter()
+        .fold(std::time::Duration::ZERO, |acc, turn| {
+            acc + turn.report.render_elapsed
+        });
+    let total_tokenize_elapsed = report
+        .turns
+        .iter()
+        .fold(std::time::Duration::ZERO, |acc, turn| {
+            acc + turn.report.tokenize_elapsed
+        });
+    let total_sync_elapsed = report
+        .turns
+        .iter()
+        .fold(std::time::Duration::ZERO, |acc, turn| {
+            acc + turn.report.sync_elapsed
+        });
+    let total_decode_elapsed = report
+        .turns
+        .iter()
+        .fold(std::time::Duration::ZERO, |acc, turn| {
+            acc + turn.report.decode_elapsed
+        });
+    let later_turns = report.turns.iter().skip(1).collect::<Vec<_>>();
+    let later_turn_appended_tokens = later_turns
+        .iter()
+        .map(|turn| turn.report.appended_prompt_tokens)
+        .sum::<usize>();
+    let later_turn_sync_elapsed = later_turns
+        .iter()
+        .fold(std::time::Duration::ZERO, |acc, turn| {
+            acc + turn.report.sync_elapsed
+        });
+
+    println!("FerrisInfer scripted chat profile");
+    println!("model path: {}", default_hf_path());
+    println!("system prompt path: {}", system_prompt_path);
+    println!("turn source: built-in scripted benchmark");
+    println!("scripted turns: {}", report.turns.len());
+    println!("max new tokens per turn: {}", max_new_tokens);
+    println!("sampler: greedy");
+    println!("model load elapsed: {:.3?}", report.load_elapsed);
+    println!(
+        "session create elapsed: {:.3?}",
+        report.session_create_elapsed
+    );
+
+    for turn in &report.turns {
+        println!(
+            "turn {}: user_chars={} reused_prompt_tokens={} appended_prompt_tokens={} generated_tokens={} finish={:?} render={:.3?} tokenize={:.3?} sync={:.3?} prefill_tok_s={:.2} decode={:.3?} decode_tok_s={:.2} reply={}",
+            turn.turn_index,
+            turn.user_text.chars().count(),
+            turn.report.reused_prompt_tokens,
+            turn.report.appended_prompt_tokens,
+            turn.report.generated_tokens,
+            turn.report.finish_reason,
+            turn.report.render_elapsed,
+            turn.report.tokenize_elapsed,
+            turn.report.sync_elapsed,
+            throughput_per_second(turn.report.appended_prompt_tokens, turn.report.sync_elapsed),
+            turn.report.decode_elapsed,
+            throughput_per_second(turn.report.generated_tokens, turn.report.decode_elapsed),
+            preview_text(&turn.assistant_text, 72),
+        );
+    }
+
+    println!("total reused prompt tokens: {}", total_reused_prompt_tokens);
+    println!(
+        "total appended prompt tokens: {}",
+        total_appended_prompt_tokens
+    );
+    println!("total generated tokens: {}", total_generated_tokens);
+    println!("total render elapsed: {:.3?}", total_render_elapsed);
+    println!("total tokenize elapsed: {:.3?}", total_tokenize_elapsed);
+    println!("total sync elapsed: {:.3?}", total_sync_elapsed);
+    println!(
+        "overall append-prefill tok/s: {:.2}",
+        throughput_per_second(total_appended_prompt_tokens, total_sync_elapsed)
+    );
+    println!("total decode elapsed: {:.3?}", total_decode_elapsed);
+    println!(
+        "overall decode tok/s: {:.2}",
+        throughput_per_second(total_generated_tokens, total_decode_elapsed)
+    );
+    if let Some(first_turn) = report.turns.first() {
+        println!(
+            "first turn sync elapsed: {:.3?}",
+            first_turn.report.sync_elapsed
+        );
+    }
+    if !later_turns.is_empty() {
+        println!("later turns sync elapsed: {:.3?}", later_turn_sync_elapsed);
+        println!(
+            "later turns append-prefill tok/s: {:.2}",
+            throughput_per_second(later_turn_appended_tokens, later_turn_sync_elapsed)
+        );
+    }
+    println!("total elapsed: {:.3?}", report.total_elapsed);
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ContinuousBatchRequestSpec {
+    arrival_tick: usize,
+    user_text: &'static str,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedContinuousBatchRequest {
+    request_index: usize,
+    arrival_tick: usize,
+    user_text: String,
+    prompt_token_ids: Vec<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct ContinuousBatchRequestProfile {
+    request_index: usize,
+    arrival_tick: usize,
+    sequence_id: SequenceId,
+    user_text: String,
+    prompt_tokens: usize,
+    generated_tokens: Vec<TokenSample>,
+    first_token_tick: Option<usize>,
+    finish_tick: Option<usize>,
+    finish_reason: Option<SequenceFinishReason>,
+    assistant_text: String,
+}
+
+#[derive(Debug, Clone)]
+struct ContinuousBatchTickProfile {
+    tick_index: usize,
+    submitted_requests: usize,
+    batch_kind: SchedulerBatchKind,
+    batch_size: usize,
+    active_sequences: usize,
+    reused_prompt_tokens: usize,
+    appended_prompt_tokens: usize,
+    generated_tokens: usize,
+    finished_sequences: usize,
+    elapsed: std::time::Duration,
+}
+
+struct ContinuousBatchProfileReport {
+    requests: Vec<ContinuousBatchRequestProfile>,
+    ticks: Vec<ContinuousBatchTickProfile>,
+    load_elapsed: std::time::Duration,
+    scheduler_create_elapsed: std::time::Duration,
+    total_elapsed: std::time::Duration,
+    scheduler_config: SchedulerConfig,
+    kv_cache: SessionKvCacheConfig,
+}
+
+fn profile_continuous_hf(
+    engine: &InferenceEngine<CpuBackend>,
+    max_new_tokens: Option<&str>,
+) -> Result<(), ()> {
+    profile_continuous_hf_with_prompt(engine, max_new_tokens, default_system_prompt_path())
+}
+
+fn profile_continuous_hf_with_prompt(
+    engine: &InferenceEngine<CpuBackend>,
+    max_new_tokens: Option<&str>,
+    system_prompt_path: &str,
+) -> Result<(), ()> {
+    warn_if_debug_profile();
+    let max_new_tokens = parse_max_new_tokens(max_new_tokens, 16)?;
+    let report = run_continuous_batch_profile(engine, max_new_tokens, system_prompt_path)?;
+    let total_prompt_tokens = report
+        .requests
+        .iter()
+        .map(|request| request.prompt_tokens)
+        .sum::<usize>();
+    let total_generated_tokens = report
+        .requests
+        .iter()
+        .map(|request| request.generated_tokens.len())
+        .sum::<usize>();
+    let prefill_ticks = report
+        .ticks
+        .iter()
+        .filter(|tick| tick.batch_kind == SchedulerBatchKind::Prefill)
+        .collect::<Vec<_>>();
+    let decode_ticks = report
+        .ticks
+        .iter()
+        .filter(|tick| tick.batch_kind == SchedulerBatchKind::Decode)
+        .collect::<Vec<_>>();
+    let total_prefill_elapsed = prefill_ticks
+        .iter()
+        .fold(std::time::Duration::ZERO, |acc, tick| acc + tick.elapsed);
+    let total_decode_elapsed = decode_ticks
+        .iter()
+        .fold(std::time::Duration::ZERO, |acc, tick| acc + tick.elapsed);
+    let total_reused_prompt_tokens = report
+        .ticks
+        .iter()
+        .map(|tick| tick.reused_prompt_tokens)
+        .sum::<usize>();
+    let total_prefill_tokens = report
+        .ticks
+        .iter()
+        .map(|tick| tick.appended_prompt_tokens)
+        .sum::<usize>();
+    let max_active_sequences = report
+        .ticks
+        .iter()
+        .map(|tick| tick.active_sequences)
+        .max()
+        .unwrap_or(0);
+    let average_batch_size = if report.ticks.is_empty() {
+        0.0
+    } else {
+        report
+            .ticks
+            .iter()
+            .map(|tick| tick.batch_size)
+            .sum::<usize>() as f64
+            / report.ticks.len() as f64
+    };
+    let average_decode_batch_size = if decode_ticks.is_empty() {
+        0.0
+    } else {
+        decode_ticks
+            .iter()
+            .map(|tick| tick.batch_size)
+            .sum::<usize>() as f64
+            / decode_ticks.len() as f64
+    };
+
+    println!("FerrisInfer continuous batching profile");
+    println!("model path: {}", default_hf_path());
+    println!("system prompt path: {}", system_prompt_path);
+    println!("request source: built-in staggered benchmark");
+    println!("requests: {}", report.requests.len());
+    println!("max new tokens per request: {}", max_new_tokens);
+    println!(
+        "scheduler batch size: {}",
+        report.scheduler_config.max_batch_size
+    );
+    println!(
+        "scheduler prefill chunk tokens: {}",
+        report.scheduler_config.max_prefill_chunk_tokens
+    );
+    println!(
+        "scheduler prefill batch token budget: {}",
+        report.scheduler_config.max_prefill_batch_tokens
+    );
+    println!(
+        "scheduler max consecutive prefill ticks: {}",
+        report.scheduler_config.max_consecutive_prefill_ticks
+    );
+    println!(
+        "scheduler min prefix share tokens: {}",
+        report.scheduler_config.min_prefix_share_tokens
+    );
+    println!("kv cache: {:?}", report.kv_cache);
+    println!("model load elapsed: {:.3?}", report.load_elapsed);
+    println!(
+        "scheduler create elapsed: {:.3?}",
+        report.scheduler_create_elapsed
+    );
+
+    for tick in &report.ticks {
+        println!(
+            "tick {}: arrivals={} kind={:?} batch={} active={} reused_prompt_tokens={} appended_prompt_tokens={} generated_tokens={} finished={} elapsed={:.3?}",
+            tick.tick_index,
+            tick.submitted_requests,
+            tick.batch_kind,
+            tick.batch_size,
+            tick.active_sequences,
+            tick.reused_prompt_tokens,
+            tick.appended_prompt_tokens,
+            tick.generated_tokens,
+            tick.finished_sequences,
+            tick.elapsed,
+        );
+    }
+
+    println!("total prompt tokens: {}", total_prompt_tokens);
+    println!("total reused prompt tokens: {}", total_reused_prompt_tokens);
+    println!("total generated tokens: {}", total_generated_tokens);
+    println!("prefill ticks: {}", prefill_ticks.len());
+    println!("decode ticks: {}", decode_ticks.len());
+    println!("max active sequences: {}", max_active_sequences);
+    println!("average tick batch size: {:.2}", average_batch_size);
+    println!(
+        "average decode batch size: {:.2}",
+        average_decode_batch_size
+    );
+    println!("total prefill elapsed: {:.3?}", total_prefill_elapsed);
+    println!(
+        "effective prompt coverage tok/s: {:.2}",
+        throughput_per_second(total_prompt_tokens, total_prefill_elapsed)
+    );
+    println!(
+        "materialized prefill tok/s: {:.2}",
+        throughput_per_second(total_prefill_tokens, total_prefill_elapsed)
+    );
+    println!("total decode elapsed: {:.3?}", total_decode_elapsed);
+    println!(
+        "continuous decode tok/s: {:.2}",
+        throughput_per_second(total_generated_tokens, total_decode_elapsed)
+    );
+    println!("total elapsed: {:.3?}", report.total_elapsed);
+
+    for request in &report.requests {
+        println!(
+            "request {}: arrival_tick={} prompt_tokens={} generated_tokens={} first_token_tick={} finish_tick={} finish={:?} user={} reply={}",
+            request.request_index,
+            request.arrival_tick,
+            request.prompt_tokens,
+            request.generated_tokens.len(),
+            request
+                .first_token_tick
+                .map(|tick| tick.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            request
+                .finish_tick
+                .map(|tick| tick.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            request.finish_reason,
+            preview_text(&request.user_text, 48),
+            preview_text(&request.assistant_text, 72),
+        );
+    }
+
+    Ok(())
+}
+
+fn run_continuous_batch_profile(
+    engine: &InferenceEngine<CpuBackend>,
+    max_new_tokens: usize,
+    system_prompt_path: &str,
+) -> Result<ContinuousBatchProfileReport, ()> {
+    const CONTINUOUS_BATCH_PAGE_SIZE: usize = 32;
+    const CONTINUOUS_BATCH_SIZE: usize = 4;
+    const CONTINUOUS_BATCH_PREFILL_CHUNK_TOKENS: usize = 64;
+    const CONTINUOUS_BATCH_PREFILL_BATCH_TOKENS: usize = 128;
+    const CONTINUOUS_BATCH_MAX_CONSECUTIVE_PREFILL_TICKS: usize = 2;
+    const CONTINUOUS_BATCH_MIN_PREFIX_SHARE_TOKENS: usize = 64;
+
+    let total_start = Instant::now();
+    let mut source = HfSource::new(default_hf_path());
+    let tokenizer_asset = source.load_tokenizer().map_err(|error| {
+        eprintln!(
+            "failed to load tokenizer from '{}': {}",
+            default_hf_path(),
+            error
+        );
+    })?;
+    let tokenizer = VocabularyTokenizer::new(tokenizer_asset);
+    let system_prompt = load_system_prompt(system_prompt_path)?;
+    let stop_config = resolve_chat_stop_config(&tokenizer)?;
+    let stop_token_id = stop_config
+        .primary_stop_token_id
+        .or(stop_config.fallback_stop_token_id);
+    let prepared_requests =
+        build_continuous_batch_requests(&tokenizer, &system_prompt, stop_token_id)?;
+
+    let load_start = Instant::now();
+    let model = Arc::new(source.load_model().map_err(|error| {
+        eprintln!("failed to load model artifacts: {}", error);
+    })?);
+    let artifacts = LoadedArtifacts {
+        model,
+        tokenizer: Arc::new(tokenizer.clone()) as Arc<dyn Tokenizer>,
+    };
+    let load_elapsed = load_start.elapsed();
+
+    let scheduler_session_config = SessionConfig {
+        max_generated_tokens: max_new_tokens,
+        sampler: SamplerConfig::greedy(),
+        kv_cache: SessionKvCacheConfig::Paged {
+            page_size: CONTINUOUS_BATCH_PAGE_SIZE,
+        },
+        ..SessionConfig::default()
+    };
+    let scheduler_config = SchedulerConfig {
+        max_batch_size: CONTINUOUS_BATCH_SIZE,
+        max_prefill_chunk_tokens: CONTINUOUS_BATCH_PREFILL_CHUNK_TOKENS,
+        max_prefill_batch_tokens: CONTINUOUS_BATCH_PREFILL_BATCH_TOKENS,
+        max_consecutive_prefill_ticks: CONTINUOUS_BATCH_MAX_CONSECUTIVE_PREFILL_TICKS,
+        min_prefix_share_tokens: CONTINUOUS_BATCH_MIN_PREFIX_SHARE_TOKENS,
+    };
+    let scheduler_create_start = Instant::now();
+    let mut scheduler = engine
+        .create_reference_scheduler(
+            &artifacts,
+            scheduler_session_config.clone(),
+            scheduler_config.clone(),
+        )
+        .map_err(|error| {
+            eprintln!("failed to create reference scheduler: {}", error);
+        })?;
+    let scheduler_create_elapsed = scheduler_create_start.elapsed();
+
+    let mut request_profiles = Vec::with_capacity(prepared_requests.len());
+    let mut ticks = Vec::new();
+    let mut next_request_index = 0usize;
+    let mut tick_index = 0usize;
+
+    while next_request_index < prepared_requests.len() || scheduler.has_pending() {
+        while next_request_index < prepared_requests.len()
+            && prepared_requests[next_request_index].arrival_tick < tick_index
+            && !scheduler.has_pending()
+        {
+            tick_index = prepared_requests[next_request_index].arrival_tick;
+        }
+
+        let mut submitted_requests = 0usize;
+        while next_request_index < prepared_requests.len()
+            && prepared_requests[next_request_index].arrival_tick == tick_index
+        {
+            let request = &prepared_requests[next_request_index];
+            let sequence_id = scheduler
+                .submit(SequenceSubmitRequest {
+                    prompt_token_ids: request.prompt_token_ids.clone(),
+                    max_new_tokens,
+                    stop_token_id,
+                })
+                .map_err(|error| {
+                    eprintln!("failed to submit continuous batching request: {}", error);
+                })?;
+            request_profiles.push(ContinuousBatchRequestProfile {
+                request_index: request.request_index,
+                arrival_tick: request.arrival_tick,
+                sequence_id,
+                user_text: request.user_text.clone(),
+                prompt_tokens: request.prompt_token_ids.len(),
+                generated_tokens: Vec::new(),
+                first_token_tick: None,
+                finish_tick: None,
+                finish_reason: None,
+                assistant_text: String::new(),
+            });
+            next_request_index += 1;
+            submitted_requests += 1;
+        }
+
+        let active_sequences = scheduler
+            .sequence_states()
+            .filter(|state| !state.is_finished())
+            .count();
+        let tick_start = Instant::now();
+        let tick_report = scheduler.execute_next_tick().map_err(|error| {
+            eprintln!("continuous batching scheduler tick failed: {}", error);
+        })?;
+        let tick_elapsed = tick_start.elapsed();
+
+        let Some(tick_report) = tick_report else {
+            if next_request_index < prepared_requests.len() {
+                tick_index = prepared_requests[next_request_index].arrival_tick;
+                continue;
+            }
+            break;
+        };
+
+        let reused_prompt_tokens = tick_report
+            .updates
+            .iter()
+            .map(|update| update.reused_prompt_tokens)
+            .sum::<usize>();
+        let appended_prompt_tokens = tick_report
+            .updates
+            .iter()
+            .map(|update| update.appended_prompt_tokens)
+            .sum::<usize>();
+        let generated_tokens = tick_report
+            .updates
+            .iter()
+            .filter(|update| update.generated_token.is_some())
+            .count();
+        let finished_sequences = tick_report
+            .updates
+            .iter()
+            .filter(|update| update.finish_reason.is_some())
+            .count();
+
+        for update in &tick_report.updates {
+            let request = request_profiles
+                .iter_mut()
+                .find(|request| request.sequence_id == update.sequence_id)
+                .ok_or_else(|| {
+                    eprintln!(
+                        "continuous batching request profile missing for sequence {}",
+                        update.sequence_id.raw()
+                    );
+                })?;
+
+            if let Some(sample) = update.generated_token {
+                request.generated_tokens.push(sample);
+                if request.first_token_tick.is_none() {
+                    request.first_token_tick = Some(tick_index);
+                }
+            }
+
+            if let Some(reason) = update.finish_reason {
+                request.finish_reason = Some(reason);
+                request.finish_tick = Some(tick_index);
+            }
+        }
+
+        ticks.push(ContinuousBatchTickProfile {
+            tick_index,
+            submitted_requests,
+            batch_kind: tick_report.tick.batch_kind(),
+            batch_size: tick_report.tick.sequence_ids().len(),
+            active_sequences,
+            reused_prompt_tokens,
+            appended_prompt_tokens,
+            generated_tokens,
+            finished_sequences,
+            elapsed: tick_elapsed,
+        });
+        tick_index += 1;
+    }
+
+    for request in &mut request_profiles {
+        request.assistant_text = artifacts
+            .tokenizer
+            .decode(
+                &request
+                    .generated_tokens
+                    .iter()
+                    .map(|sample| sample.token_id)
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(|error| {
+                eprintln!("failed to decode continuous batching tokens: {}", error);
+            })?;
+    }
+
+    Ok(ContinuousBatchProfileReport {
+        requests: request_profiles,
+        ticks,
+        load_elapsed,
+        scheduler_create_elapsed,
+        total_elapsed: total_start.elapsed(),
+        scheduler_config,
+        kv_cache: scheduler_session_config.kv_cache,
+    })
+}
+
+fn build_continuous_batch_requests(
+    tokenizer: &VocabularyTokenizer,
+    system_prompt: &str,
+    _stop_token_id: Option<u32>,
+) -> Result<Vec<PreparedContinuousBatchRequest>, ()> {
+    let mut prepared = Vec::with_capacity(default_continuous_batch_requests().len());
+    for (request_index, request) in default_continuous_batch_requests()
+        .iter()
+        .copied()
+        .enumerate()
+    {
+        let rendered = render_default_chat_prompt(tokenizer, request.user_text, system_prompt)?;
+        let prompt_token_ids = tokenizer.encode(&rendered, false).map_err(|error| {
+            eprintln!("failed to tokenize continuous batching prompt: {}", error);
+        })?;
+        prepared.push(PreparedContinuousBatchRequest {
+            request_index: request_index + 1,
+            arrival_tick: request.arrival_tick,
+            user_text: request.user_text.to_string(),
+            prompt_token_ids,
+        });
+    }
+    Ok(prepared)
+}
+
+fn default_continuous_batch_requests() -> &'static [ContinuousBatchRequestSpec] {
+    &[
+        ContinuousBatchRequestSpec {
+            arrival_tick: 0,
+            user_text: "你好",
+        },
+        ContinuousBatchRequestSpec {
+            arrival_tick: 2,
+            user_text: "请用一句话介绍你自己。",
+        },
+        ContinuousBatchRequestSpec {
+            arrival_tick: 4,
+            user_text: "列出三个关键词描述 Rust。",
+        },
+        ContinuousBatchRequestSpec {
+            arrival_tick: 6,
+            user_text: "把 FerrisInfer 的目标压缩成一句话。",
+        },
+    ]
+}
+fn run_scripted_chat_profile(
+    engine: &InferenceEngine<CpuBackend>,
+    max_new_tokens: usize,
+    system_prompt_path: &str,
+) -> Result<ScriptedChatProfileReport, ()> {
+    let total_start = Instant::now();
+    let mut source = HfSource::new(default_hf_path());
+    let tokenizer_asset = source.load_tokenizer().map_err(|error| {
+        eprintln!(
+            "failed to load tokenizer from '{}': {}",
+            default_hf_path(),
+            error
+        );
+    })?;
+    let tokenizer = VocabularyTokenizer::new(tokenizer_asset);
+    let system_prompt = load_system_prompt(system_prompt_path)?;
+    let stop_config = resolve_chat_stop_config(&tokenizer)?;
+
+    let load_start = Instant::now();
+    let model = Arc::new(source.load_model().map_err(|error| {
+        eprintln!("failed to load model artifacts: {}", error);
+    })?);
+    let artifacts = LoadedArtifacts {
+        model,
+        tokenizer: Arc::new(tokenizer.clone()) as Arc<dyn Tokenizer>,
+    };
+    let load_elapsed = load_start.elapsed();
+
+    let session_create_start = Instant::now();
+    let mut session_config = SessionConfig::default();
+    session_config.sampler = SamplerConfig::greedy();
+    let mut session = engine
+        .create_session(&artifacts, session_config)
+        .map_err(|error| {
+            eprintln!("failed to create inference session: {}", error);
+        })?;
+    let session_create_elapsed = session_create_start.elapsed();
+
+    let mut messages = vec![ChatMessage::system(system_prompt)];
+    let mut turns = Vec::with_capacity(default_profile_chat_turns().len());
+
+    for (turn_index, user_text) in default_profile_chat_turns().iter().copied().enumerate() {
+        messages.push(ChatMessage::user(user_text));
+        let (report, assistant_text) = run_chat_turn_profile(
+            &tokenizer,
+            &mut session,
+            &mut messages,
+            max_new_tokens,
+            &stop_config,
+        )?;
+        turns.push(ScriptedChatTurnProfile {
+            turn_index: turn_index + 1,
+            user_text: user_text.to_string(),
+            assistant_text,
+            report,
+        });
+    }
+
+    Ok(ScriptedChatProfileReport {
+        turns,
+        load_elapsed,
+        session_create_elapsed,
+        total_elapsed: total_start.elapsed(),
+    })
+}
+
+fn run_chat_turn_profile(
+    tokenizer: &VocabularyTokenizer,
+    session: &mut Session,
+    messages: &mut Vec<ChatMessage>,
+    max_new_tokens: usize,
+    stop_config: &ChatStopConfig,
+) -> Result<(ChatTurnReport, String), ()> {
+    let render_start = Instant::now();
+    let rendered = tokenizer.render_chat(messages, true).map_err(|error| {
+        eprintln!("failed to render chat prompt: {}", error);
+    })?;
+    let render_elapsed = render_start.elapsed();
+
+    let tokenize_start = Instant::now();
+    let prompt_token_ids = tokenizer.encode(&rendered, false).map_err(|error| {
+        eprintln!("failed to tokenize rendered prompt: {}", error);
+    })?;
+    let tokenize_elapsed = tokenize_start.elapsed();
+
+    let sync_start = Instant::now();
+    let (reused_prompt_tokens, appended_prompt_tokens) =
+        sync_session_to_prompt(session, &prompt_token_ids)?;
+    let sync_elapsed = sync_start.elapsed();
+
+    let decode_start = Instant::now();
+    let (generated_tokens, assistant_text, finish_reason) =
+        collect_reference_tokens_with_fallback_stop(
+            tokenizer,
+            session,
+            max_new_tokens,
+            stop_config,
+        )?;
+    let decode_elapsed = decode_start.elapsed();
+
+    messages.push(ChatMessage::assistant(assistant_text.clone()));
+
+    Ok((
+        ChatTurnReport {
+            reused_prompt_tokens,
+            appended_prompt_tokens,
+            generated_tokens: generated_tokens.len(),
+            finish_reason,
+            render_elapsed,
+            tokenize_elapsed,
+            sync_elapsed,
+            decode_elapsed,
+        },
+        assistant_text,
+    ))
+}
+
+fn default_profile_chat_turns() -> &'static [&'static str] {
+    &[
+        "你好",
+        "请用一句话介绍你自己。",
+        "把上一句压缩成十个字以内。",
+        "总结一下我们刚才这段对话的重点。",
+    ]
 }
 
 struct ReferenceGenerationReport {
@@ -1224,6 +2138,25 @@ mod tests {
         assert_eq!(common_prefix_len(&[1, 2, 3, 4], &[1, 2, 9]), 2);
         assert_eq!(common_prefix_len(&[1, 2], &[1, 2, 3]), 2);
         assert_eq!(common_prefix_len(&[7, 8], &[9, 8]), 0);
+    }
+
+    #[test]
+    fn default_profile_chat_turns_are_nonempty() {
+        assert!(!default_profile_chat_turns().is_empty());
+        assert!(default_profile_chat_turns()
+            .iter()
+            .all(|turn| !turn.trim().is_empty()));
+    }
+
+    #[test]
+    fn default_continuous_batch_requests_are_nonempty_and_sorted() {
+        assert!(!default_continuous_batch_requests().is_empty());
+        assert!(default_continuous_batch_requests()
+            .iter()
+            .all(|request| !request.user_text.trim().is_empty()));
+        assert!(default_continuous_batch_requests()
+            .windows(2)
+            .all(|pair| pair[0].arrival_tick <= pair[1].arrival_tick));
     }
 
     #[test]

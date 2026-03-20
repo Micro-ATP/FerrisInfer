@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+homepage.workspace = true
+description.workspace = true
 
 [dependencies]
 ferrisinfer-core.workspace = true
+

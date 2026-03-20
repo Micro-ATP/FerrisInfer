@@ -329,6 +329,194 @@ pub fn prefixed_causal_attention_f32(
     Ok(())
 }
 
+pub fn cached_prefixed_causal_attention_f32(
+    query: &Tensor,
+    cached_key: &Tensor,
+    cached_value: &Tensor,
+    cache_len: usize,
+    key_suffix: &Tensor,
+    value_suffix: &Tensor,
+    out: &mut Tensor,
+) -> Result<()> {
+    validate_attention_tensor(query)?;
+    validate_attention_tensor(cached_key)?;
+    validate_attention_tensor(cached_value)?;
+    validate_attention_tensor(key_suffix)?;
+    validate_attention_tensor(value_suffix)?;
+    validate_attention_tensor(out)?;
+
+    let query_dims = query.shape().dims();
+    let cache_key_dims = cached_key.shape().dims();
+    let cache_value_dims = cached_value.shape().dims();
+    let key_suffix_dims = key_suffix.shape().dims();
+    let value_suffix_dims = value_suffix.shape().dims();
+    let out_dims = out.shape().dims();
+
+    let query_len = query_dims[0];
+    let num_query_heads = query_dims[1];
+    let head_dim = query_dims[2];
+    let num_kv_heads = key_suffix_dims[1];
+
+    if out_dims != query_dims {
+        return Err(FerrisError::new(
+            ErrorKind::InvalidShape,
+            "attention output tensor must match query tensor shape",
+        ));
+    }
+
+    if cache_key_dims[0] < cache_len
+        || cache_value_dims[0] < cache_len
+        || cache_value_dims[1] != num_kv_heads
+        || cache_key_dims[2] != head_dim
+        || cache_value_dims[2] != head_dim
+    {
+        return Err(FerrisError::new(
+            ErrorKind::InvalidShape,
+            "cached attention tensors must cover cache_len and match head dimensions",
+        ));
+    }
+
+    if key_suffix_dims[0] != query_len
+        || value_suffix_dims[0] != query_len
+        || value_suffix_dims[1] != num_kv_heads
+        || key_suffix_dims[2] != head_dim
+        || value_suffix_dims[2] != head_dim
+    {
+        return Err(FerrisError::new(
+            ErrorKind::InvalidShape,
+            "attention suffix tensors must match query length and head dimension",
+        ));
+    }
+
+    if value_suffix_dims != key_suffix_dims {
+        return Err(FerrisError::new(
+            ErrorKind::InvalidShape,
+            "attention key/value suffix tensors must have matching shapes",
+        ));
+    }
+
+    if num_query_heads % num_kv_heads != 0 {
+        return Err(FerrisError::new(
+            ErrorKind::InvalidShape,
+            "number of query heads must be divisible by number of KV heads",
+        ));
+    }
+
+    let queries_per_kv_head = num_query_heads / num_kv_heads;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    let query_values = query.as_f32_slice()?;
+    let key_suffix_values = key_suffix.as_f32_slice()?;
+    let value_suffix_values = value_suffix.as_f32_slice()?;
+    let out_values = out.as_f32_slice_mut()?;
+    let cached_key_values = cached_key.as_f32_slice().ok();
+    let cached_value_values = cached_value.as_f32_slice().ok();
+    let cached_key_bytes = cached_key.as_bytes();
+    let cached_value_bytes = cached_value.as_bytes();
+
+    let attended_len = cache_len
+        .checked_add(query_len)
+        .ok_or_else(|| FerrisError::new(ErrorKind::Runtime, "attention length overflow"))?;
+    let thread_count =
+        preferred_attention_thread_count(query_len, num_query_heads, head_dim, attended_len);
+    if thread_count == 1 {
+        if let (Some(cached_key_values), Some(cached_value_values)) =
+            (cached_key_values, cached_value_values)
+        {
+            compute_cached_prefixed_attention_chunk_f32(
+                query_values,
+                cached_key_values,
+                cached_value_values,
+                key_suffix_values,
+                value_suffix_values,
+                out_values,
+                0,
+                query_len,
+                cache_len,
+                num_query_heads,
+                num_kv_heads,
+                queries_per_kv_head,
+                head_dim,
+                scale,
+            );
+        } else {
+            compute_cached_prefixed_attention_chunk_packed(
+                query_values,
+                cached_key_bytes,
+                cached_value_bytes,
+                key_suffix_values,
+                value_suffix_values,
+                out_values,
+                0,
+                query_len,
+                cache_len,
+                num_query_heads,
+                num_kv_heads,
+                queries_per_kv_head,
+                head_dim,
+                scale,
+            );
+        }
+    } else {
+        let positions_per_chunk = query_len.div_ceil(thread_count);
+        let chunk_width = positions_per_chunk * num_query_heads * head_dim;
+
+        std::thread::scope(|scope| {
+            for (chunk_index, out_chunk) in out_values.chunks_mut(chunk_width).enumerate() {
+                let position_start = chunk_index * positions_per_chunk;
+                let position_end = (position_start + positions_per_chunk).min(query_len);
+                let query_values = &query_values;
+                let key_suffix_values = &key_suffix_values;
+                let value_suffix_values = &value_suffix_values;
+                let cached_key_values = cached_key_values;
+                let cached_value_values = cached_value_values;
+
+                scope.spawn(move || {
+                    if let (Some(cached_key_values), Some(cached_value_values)) =
+                        (cached_key_values, cached_value_values)
+                    {
+                        compute_cached_prefixed_attention_chunk_f32(
+                            query_values,
+                            cached_key_values,
+                            cached_value_values,
+                            key_suffix_values,
+                            value_suffix_values,
+                            out_chunk,
+                            position_start,
+                            position_end,
+                            cache_len,
+                            num_query_heads,
+                            num_kv_heads,
+                            queries_per_kv_head,
+                            head_dim,
+                            scale,
+                        );
+                    } else {
+                        compute_cached_prefixed_attention_chunk_packed(
+                            query_values,
+                            cached_key_bytes,
+                            cached_value_bytes,
+                            key_suffix_values,
+                            value_suffix_values,
+                            out_chunk,
+                            position_start,
+                            position_end,
+                            cache_len,
+                            num_query_heads,
+                            num_kv_heads,
+                            queries_per_kv_head,
+                            head_dim,
+                            scale,
+                        );
+                    }
+                });
+            }
+        });
+    }
+
+    Ok(())
+}
+
 pub fn decode_causal_attention_f32(
     query: &Tensor,
     cached_key: &Tensor,
@@ -582,6 +770,187 @@ fn compute_attention_chunk(
                     attention_index(attended_position, kv_head, 0, num_kv_heads, head_dim);
                 let value_row = &value_values[value_base..value_base + head_dim];
                 accumulate_weighted_values(out_row, value_row, weight);
+            }
+
+            let inv_score_sum = 1.0 / score_sum;
+            for value in out_row.iter_mut() {
+                *value *= inv_score_sum;
+            }
+        }
+    }
+}
+#[allow(clippy::too_many_arguments)]
+fn compute_cached_prefixed_attention_chunk_f32(
+    query_values: &[f32],
+    cached_key_values: &[f32],
+    cached_value_values: &[f32],
+    key_suffix_values: &[f32],
+    value_suffix_values: &[f32],
+    out_chunk: &mut [f32],
+    position_start: usize,
+    position_end: usize,
+    cache_len: usize,
+    num_query_heads: usize,
+    num_kv_heads: usize,
+    queries_per_kv_head: usize,
+    head_dim: usize,
+    scale: f32,
+) {
+    for (local_position, query_position) in (position_start..position_end).enumerate() {
+        let max_attended_position = cache_len + query_position;
+
+        for query_head in 0..num_query_heads {
+            let kv_head = query_head / queries_per_kv_head;
+            let query_base =
+                attention_index(query_position, query_head, 0, num_query_heads, head_dim);
+            let query_row = &query_values[query_base..query_base + head_dim];
+            let out_base =
+                attention_index(local_position, query_head, 0, num_query_heads, head_dim);
+            let out_row = &mut out_chunk[out_base..out_base + head_dim];
+            out_row.fill(0.0);
+            let mut max_score = f32::NEG_INFINITY;
+            let mut score_sum = 0.0f32;
+
+            for attended_position in 0..=max_attended_position {
+                let score = if attended_position < cache_len {
+                    dot_product_with_values(
+                        query_row,
+                        cached_key_values,
+                        attended_position,
+                        kv_head,
+                        num_kv_heads,
+                        head_dim,
+                    )
+                } else {
+                    dot_product_with_values(
+                        query_row,
+                        key_suffix_values,
+                        attended_position - cache_len,
+                        kv_head,
+                        num_kv_heads,
+                        head_dim,
+                    )
+                } * scale;
+
+                let weight = update_online_softmax_accumulator(
+                    out_row,
+                    &mut max_score,
+                    &mut score_sum,
+                    score,
+                );
+
+                if attended_position < cache_len {
+                    accumulate_weighted_values_from_cache(
+                        out_row,
+                        cached_value_values,
+                        attended_position,
+                        kv_head,
+                        num_kv_heads,
+                        head_dim,
+                        weight,
+                    );
+                } else {
+                    accumulate_weighted_values_from_cache(
+                        out_row,
+                        value_suffix_values,
+                        attended_position - cache_len,
+                        kv_head,
+                        num_kv_heads,
+                        head_dim,
+                        weight,
+                    );
+                }
+            }
+
+            let inv_score_sum = 1.0 / score_sum;
+            for value in out_row.iter_mut() {
+                *value *= inv_score_sum;
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_cached_prefixed_attention_chunk_packed(
+    query_values: &[f32],
+    cached_key_bytes: &[u8],
+    cached_value_bytes: &[u8],
+    key_suffix_values: &[f32],
+    value_suffix_values: &[f32],
+    out_chunk: &mut [f32],
+    position_start: usize,
+    position_end: usize,
+    cache_len: usize,
+    num_query_heads: usize,
+    num_kv_heads: usize,
+    queries_per_kv_head: usize,
+    head_dim: usize,
+    scale: f32,
+) {
+    for (local_position, query_position) in (position_start..position_end).enumerate() {
+        let max_attended_position = cache_len + query_position;
+
+        for query_head in 0..num_query_heads {
+            let kv_head = query_head / queries_per_kv_head;
+            let query_base =
+                attention_index(query_position, query_head, 0, num_query_heads, head_dim);
+            let query_row = &query_values[query_base..query_base + head_dim];
+            let out_base =
+                attention_index(local_position, query_head, 0, num_query_heads, head_dim);
+            let out_row = &mut out_chunk[out_base..out_base + head_dim];
+            out_row.fill(0.0);
+            let mut max_score = f32::NEG_INFINITY;
+            let mut score_sum = 0.0f32;
+
+            for attended_position in 0..=max_attended_position {
+                let score = if attended_position < cache_len {
+                    dot_product_with_packed_values(
+                        query_row,
+                        cached_key_bytes,
+                        attended_position,
+                        kv_head,
+                        num_kv_heads,
+                        head_dim,
+                    )
+                } else {
+                    dot_product_with_values(
+                        query_row,
+                        key_suffix_values,
+                        attended_position - cache_len,
+                        kv_head,
+                        num_kv_heads,
+                        head_dim,
+                    )
+                } * scale;
+
+                let weight = update_online_softmax_accumulator(
+                    out_row,
+                    &mut max_score,
+                    &mut score_sum,
+                    score,
+                );
+
+                if attended_position < cache_len {
+                    accumulate_weighted_packed_values(
+                        out_row,
+                        cached_value_bytes,
+                        attended_position,
+                        kv_head,
+                        num_kv_heads,
+                        head_dim,
+                        weight,
+                    );
+                } else {
+                    accumulate_weighted_values_from_cache(
+                        out_row,
+                        value_suffix_values,
+                        attended_position - cache_len,
+                        kv_head,
+                        num_kv_heads,
+                        head_dim,
+                        weight,
+                    );
+                }
             }
 
             let inv_score_sum = 1.0 / score_sum;
@@ -1010,6 +1379,55 @@ mod tests {
         prefixed_causal_attention_f32(&query, &key, &value, 1, &mut out).unwrap();
 
         approx_eq_slice(&out.to_vec_f32().unwrap(), &[0.33023846, 0.66976154], 1e-6);
+    }
+    #[test]
+    fn cached_prefixed_causal_attention_f32_matches_prefixed_reference() {
+        let query = Tensor::from_f32_vec(
+            Shape::from_slice(&[2, 1, 2]).unwrap(),
+            vec![1.0, 0.0, 0.0, 1.0],
+        )
+        .unwrap();
+        let cached_key = Tensor::from_f32_vec(
+            Shape::from_slice(&[4, 1, 2]).unwrap(),
+            vec![1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        )
+        .unwrap();
+        let cached_value = cached_key.clone();
+        let key_suffix = Tensor::from_f32_vec(
+            Shape::from_slice(&[2, 1, 2]).unwrap(),
+            vec![1.0, 0.0, 0.0, 1.0],
+        )
+        .unwrap();
+        let value_suffix = key_suffix.clone();
+        let full_key = Tensor::from_f32_vec(
+            Shape::from_slice(&[3, 1, 2]).unwrap(),
+            vec![1.0, 1.0, 1.0, 0.0, 0.0, 1.0],
+        )
+        .unwrap();
+        let full_value = full_key.clone();
+        let mut cached_out =
+            Tensor::zeros(DType::F32, Shape::from_slice(&[2, 1, 2]).unwrap()).unwrap();
+        let mut prefixed_out =
+            Tensor::zeros(DType::F32, Shape::from_slice(&[2, 1, 2]).unwrap()).unwrap();
+
+        cached_prefixed_causal_attention_f32(
+            &query,
+            &cached_key,
+            &cached_value,
+            1,
+            &key_suffix,
+            &value_suffix,
+            &mut cached_out,
+        )
+        .unwrap();
+        prefixed_causal_attention_f32(&query, &full_key, &full_value, 1, &mut prefixed_out)
+            .unwrap();
+
+        approx_eq_slice(
+            &cached_out.to_vec_f32().unwrap(),
+            &prefixed_out.to_vec_f32().unwrap(),
+            1e-6,
+        );
     }
 
     #[test]

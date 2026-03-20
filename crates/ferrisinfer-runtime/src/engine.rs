@@ -6,6 +6,7 @@ use ferrisinfer_kernel::Backend;
 use ferrisinfer_model::DecoderOnlyModel;
 
 use crate::plan::{ExecutionMode, ExecutionPlan};
+use crate::scheduler::{ReferenceScheduler, SchedulerConfig};
 use crate::session::{Session, SessionConfig};
 
 pub struct LoadedArtifacts {
@@ -50,6 +51,20 @@ impl<B: Backend> InferenceEngine<B> {
             Arc::clone(&artifacts.model),
             Arc::clone(&artifacts.tokenizer),
             config,
+        )
+    }
+
+    pub fn create_reference_scheduler(
+        &self,
+        artifacts: &LoadedArtifacts,
+        session_config: SessionConfig,
+        scheduler_config: SchedulerConfig,
+    ) -> Result<ReferenceScheduler> {
+        ReferenceScheduler::new(
+            Arc::clone(&artifacts.model),
+            Arc::clone(&artifacts.tokenizer),
+            session_config,
+            scheduler_config,
         )
     }
 }

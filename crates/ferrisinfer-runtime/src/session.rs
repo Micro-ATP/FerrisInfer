@@ -5,18 +5,33 @@ use ferrisinfer_io::Tokenizer;
 use ferrisinfer_model::DecoderOnlyModel;
 
 use crate::kv_cache::{KvCache, KvCacheConfig};
+use crate::paged_kv::PrefixHandle;
 use crate::reference::{
     decoder_model_prefill_last_token_logits_with_kv_cache_f32,
-    decoder_model_prefill_last_token_sample_with_kv_cache_f32, decoder_model_token_logits_with_kv_cache_buffered_f32,
+    decoder_model_prefill_last_token_sample_with_kv_cache_f32,
+    decoder_model_token_logits_with_kv_cache_buffered_f32,
     decoder_model_token_sample_with_kv_cache_buffered_f32, DecodeWorkspace,
 };
 use crate::sampler::{sample_last_token, SamplerConfig, SamplerState, TokenSample};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionKvCacheConfig {
+    Contiguous,
+    Paged { page_size: usize },
+}
+
+impl Default for SessionKvCacheConfig {
+    fn default() -> Self {
+        Self::Contiguous
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
     pub max_sequence_length: usize,
     pub max_generated_tokens: usize,
     pub sampler: SamplerConfig,
+    pub kv_cache: SessionKvCacheConfig,
 }
 
 impl Default for SessionConfig {
@@ -25,6 +40,7 @@ impl Default for SessionConfig {
             max_sequence_length: 4096,
             max_generated_tokens: 512,
             sampler: SamplerConfig::default(),
+            kv_cache: SessionKvCacheConfig::default(),
         }
     }
 }
@@ -94,13 +110,19 @@ impl Session {
         let sampler_seed = config.sampler.seed;
         let (kv_cache, decode_workspace) = {
             let model_config = model.config();
-            let kv_cache = KvCache::new(KvCacheConfig {
+            let kv_config = KvCacheConfig {
                 num_layers: model_config.num_layers,
                 num_kv_heads: model_config.num_key_value_heads,
                 head_dim: model_config.head_dim(),
                 max_sequence_length: config.max_sequence_length,
                 dtype: DType::F32,
-            })?;
+            };
+            let kv_cache = match config.kv_cache {
+                SessionKvCacheConfig::Contiguous => KvCache::new_contiguous(kv_config)?,
+                SessionKvCacheConfig::Paged { page_size } => {
+                    KvCache::new_paged(kv_config, page_size)?
+                }
+            };
             let decode_workspace = DecodeWorkspace::new(model_config)?;
             (kv_cache, decode_workspace)
         };
@@ -138,6 +160,49 @@ impl Session {
         &self.token_history
     }
 
+    pub fn prefix_handle(&self, token_count: usize) -> Result<Option<PrefixHandle>> {
+        if token_count > self.position {
+            return Err(FerrisError::new(
+                ErrorKind::InvalidShape,
+                format!(
+                    "session prefix handle length {token_count} exceeds committed tokens {}",
+                    self.position
+                ),
+            ));
+        }
+
+        self.kv_cache.prefix_handle(token_count)
+    }
+
+    pub fn copy_prefix_from_session(&mut self, source: &Session, token_count: usize) -> Result<()> {
+        if token_count > source.token_history.len() {
+            return Err(FerrisError::new(
+                ErrorKind::InvalidShape,
+                format!(
+                    "session prefix length {token_count} exceeds source token history {}",
+                    source.token_history.len()
+                ),
+            ));
+        }
+
+        self.reset();
+        self.kv_cache
+            .copy_prefix_from(&source.kv_cache, token_count)?;
+        self.position = token_count;
+        self.token_history
+            .extend_from_slice(&source.token_history[..token_count]);
+
+        if token_count == source.position
+            && Arc::ptr_eq(&self.model, &source.model)
+            && sampler_configs_match(&self.config.sampler, &source.config.sampler)
+        {
+            self.last_sample = source.last_sample;
+            self.sampler_state = source.sampler_state;
+        }
+
+        Ok(())
+    }
+
     pub fn reset(&mut self) {
         self.kv_cache.reset();
         self.position = 0;
@@ -167,7 +232,7 @@ impl Session {
             ));
         }
 
-        if self.position == 0 && token_ids.len() > 1 {
+        if token_ids.len() > 1 {
             self.process_reference_prefill_tokens(token_ids)?;
             return Ok(());
         }
@@ -347,6 +412,14 @@ impl Session {
     }
 }
 
+fn sampler_configs_match(left: &SamplerConfig, right: &SamplerConfig) -> bool {
+    left.temperature == right.temperature
+        && left.top_k == right.top_k
+        && left.top_p == right.top_p
+        && left.repetition_penalty == right.repetition_penalty
+        && left.seed == right.seed
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -436,6 +509,76 @@ mod tests {
         assert_eq!(session.token_history(), &[0, 1, 1]);
         assert_eq!(sample.token_id, 1);
     }
+    #[test]
+    fn prefill_tokens_batches_appended_prompt_and_preserves_last_sample() {
+        let mut session = test_session(SessionConfig::default());
+
+        session.prefill_tokens(&[0]).unwrap();
+        session.prefill_tokens(&[1, 0]).unwrap();
+        let sample = session.step_reference().unwrap();
+
+        assert_eq!(session.position(), 4);
+        assert_eq!(session.kv_cache().used_tokens(), 4);
+        assert_eq!(session.token_history(), &[0, 1, 0, 1]);
+        assert_eq!(sample.token_id, 1);
+    }
+
+    #[test]
+    fn paged_kv_cache_prefill_and_decode_remain_functional() {
+        let mut session = test_session(SessionConfig {
+            kv_cache: SessionKvCacheConfig::Paged { page_size: 2 },
+            ..SessionConfig::default()
+        });
+
+        session.prefill_tokens(&[0, 1, 0]).unwrap();
+        let sample = session.step_reference().unwrap();
+
+        assert_eq!(
+            session.kv_cache().storage_kind(),
+            crate::kv_cache::KvCacheStorageKind::Paged
+        );
+        assert_eq!(session.position(), 4);
+        assert_eq!(session.kv_cache().used_tokens(), 4);
+        assert_eq!(session.token_history(), &[0, 1, 0, 1]);
+        assert_eq!(sample.token_id, 1);
+    }
+
+    #[test]
+    fn paged_session_exposes_prefix_handle() {
+        let mut session = test_session(SessionConfig {
+            kv_cache: SessionKvCacheConfig::Paged { page_size: 2 },
+            ..SessionConfig::default()
+        });
+
+        session.prefill_tokens(&[0, 1, 0]).unwrap();
+
+        let handle = session.prefix_handle(3).unwrap().unwrap();
+        assert_eq!(handle.token_count(), 3);
+        assert_eq!(handle.page_size(), 2);
+        assert_eq!(handle.layer_block_table(0).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn copy_prefix_from_session_preserves_decode_state_for_exact_prefix() {
+        let config = SessionConfig {
+            kv_cache: SessionKvCacheConfig::Paged { page_size: 2 },
+            ..SessionConfig::default()
+        };
+        let model = Arc::new(always_one_model());
+        let tokenizer = Arc::new(DummyTokenizer) as Arc<dyn Tokenizer>;
+        let mut source =
+            Session::new(Arc::clone(&model), Arc::clone(&tokenizer), config.clone()).unwrap();
+        let mut dest = Session::new(model, tokenizer, config).unwrap();
+
+        source.prefill_tokens(&[0, 1, 0]).unwrap();
+        dest.copy_prefix_from_session(&source, 3).unwrap();
+        let sample = dest.step_reference().unwrap();
+
+        assert_eq!(dest.position(), 4);
+        assert_eq!(dest.kv_cache().used_tokens(), 4);
+        assert_eq!(dest.token_history(), &[0, 1, 0, 1]);
+        assert_eq!(sample.token_id, 1);
+    }
 
     #[test]
     fn generate_reference_from_tokens_stops_on_stop_token() {
@@ -459,6 +602,7 @@ mod tests {
             max_sequence_length: 8,
             max_generated_tokens: 1,
             sampler: SamplerConfig::default(),
+            ..SessionConfig::default()
         });
 
         let output = session

@@ -1,6 +1,13 @@
+pub mod nvidia;
+
 use ferrisinfer_core::{DeviceKind, ExecutionConfig, FerrisError, Result, Tensor};
 
-use crate::backend::{Backend, BackendCapabilities};
+use crate::backend::{Backend, BackendAvailability, BackendCapabilities};
+
+pub use nvidia::{
+    probe_nvidia_cuda, NvidiaCudaBackend, NvidiaCudaDeviceInfo, NvidiaCudaDriverVersion,
+    NvidiaCudaProbe,
+};
 
 #[derive(Debug, Clone)]
 pub struct GpuBackend {
@@ -17,7 +24,7 @@ impl GpuBackend {
 impl Backend for GpuBackend {
     fn name(&self) -> &'static str {
         match self.device {
-            DeviceKind::Cuda => "cuda",
+            DeviceKind::Cuda => "generic-cuda",
             DeviceKind::Metal => "metal",
             DeviceKind::Vulkan => "vulkan",
             DeviceKind::WebGpu => "webgpu",
@@ -43,9 +50,15 @@ impl Backend for GpuBackend {
         }
     }
 
+    fn availability(&self) -> BackendAvailability {
+        BackendAvailability::unavailable(
+            "generic GPU backend is a placeholder; use a concrete backend such as NVIDIA CUDA",
+        )
+    }
+
     fn fill_zero(&self, _tensor: &mut Tensor) -> Result<()> {
         Err(FerrisError::unsupported(
-            "GPU tensor execution is not implemented yet",
+            "generic GPU tensor execution is not implemented yet",
         ))
     }
 }

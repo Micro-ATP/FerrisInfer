@@ -5,7 +5,7 @@ pub mod reduction;
 
 use ferrisinfer_core::{DeviceKind, ExecutionConfig, Result, Tensor};
 
-use crate::backend::{Backend, BackendCapabilities};
+use crate::backend::{Backend, BackendAvailability, BackendCapabilities};
 
 #[derive(Debug, Clone)]
 pub struct CpuBackend {
@@ -45,6 +45,10 @@ impl Backend for CpuBackend {
             device_memory: false,
             graph_capture: false,
         }
+    }
+
+    fn availability(&self) -> BackendAvailability {
+        BackendAvailability::available()
     }
 
     fn fill_zero(&self, tensor: &mut Tensor) -> Result<()> {
