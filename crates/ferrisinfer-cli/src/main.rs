@@ -11,7 +11,7 @@ use ferrisinfer_kernel::{Backend, CpuBackend};
 use ferrisinfer_model::DecoderOnlyModel;
 use ferrisinfer_runtime::{
     ExecutionMode, GenerationFinishReason, GenerationRequest, InferenceEngine, LoadedArtifacts,
-    Session, SessionConfig, TokenSample,
+    SamplerConfig, Session, SessionConfig, TokenSample,
 };
 
 const DEFAULT_HF_PATH: &str = "models/Qwen2.5-0.5B-Instruct";
@@ -41,10 +41,22 @@ fn main() {
             default_short_system_prompt_path(),
         ),
         Some("chat-hf") => chat_hf(&engine, args.get(2).map(String::as_str)),
+        Some("chat-hf-greedy") => chat_hf_with_sampler(
+            &engine,
+            args.get(2).map(String::as_str),
+            default_system_prompt_path(),
+            SamplerConfig::greedy(),
+        ),
         Some("chat-hf-short") => chat_hf_with_prompt(
             &engine,
             args.get(2).map(String::as_str),
             default_short_system_prompt_path(),
+        ),
+        Some("chat-hf-short-greedy") => chat_hf_with_sampler(
+            &engine,
+            args.get(2).map(String::as_str),
+            default_short_system_prompt_path(),
+            SamplerConfig::greedy(),
         ),
         Some("render-chat-hf") => render_chat_hf(args.get(2).map(String::as_str)),
         Some("render-chat-hf-short") => render_chat_hf_with_prompt(
@@ -88,6 +100,9 @@ fn main() {
 
 fn print_help() {
     println!("FerrisInfer CLI");
+    println!(
+        "Use `cargo run --release -p ferrisinfer-cli -- <command>` for meaningful CPU performance measurements."
+    );
     println!("Commands:");
     println!("  help                           Show this message");
     println!("  plan                           Print the current implementation framework");
@@ -98,7 +113,9 @@ fn print_help() {
     println!("  profile-hf [text] [tokens]     Measure load/session/prefill/decode timings");
     println!("  profile-hf-short [text] [tokens] Measure timings with docs/system_prompt_short.md");
     println!("  chat-hf [tokens]               Start an interactive multi-turn chat session");
+    println!("  chat-hf-greedy [tokens]        Start chat with greedy decoding");
     println!("  chat-hf-short [tokens]         Start chat with docs/system_prompt_short.md");
+    println!("  chat-hf-short-greedy [tokens]  Start short-prompt chat with greedy decoding");
     println!(
         "  render-chat-hf [text]          Render the default Qwen chat prompt for a user message"
     );
@@ -227,6 +244,7 @@ fn inspect_hf(path: Option<&str>) -> Result<(), ()> {
 }
 
 fn profile_hf_load(path: Option<&str>) -> Result<(), ()> {
+    warn_if_debug_profile();
     let path = path.unwrap_or(default_hf_path());
     let mut source = HfSource::new(path);
     let available_parallelism = thread::available_parallelism()
@@ -285,7 +303,12 @@ fn profile_hf_load(path: Option<&str>) -> Result<(), ()> {
 }
 
 fn chat_hf(engine: &InferenceEngine<CpuBackend>, max_new_tokens: Option<&str>) -> Result<(), ()> {
-    chat_hf_with_prompt(engine, max_new_tokens, default_system_prompt_path())
+    chat_hf_with_sampler(
+        engine,
+        max_new_tokens,
+        default_system_prompt_path(),
+        SamplerConfig::chat_default(),
+    )
 }
 
 fn chat_hf_with_prompt(
@@ -293,6 +316,21 @@ fn chat_hf_with_prompt(
     max_new_tokens: Option<&str>,
     system_prompt_path: &str,
 ) -> Result<(), ()> {
+    chat_hf_with_sampler(
+        engine,
+        max_new_tokens,
+        system_prompt_path,
+        SamplerConfig::chat_default(),
+    )
+}
+
+fn chat_hf_with_sampler(
+    engine: &InferenceEngine<CpuBackend>,
+    max_new_tokens: Option<&str>,
+    system_prompt_path: &str,
+    sampler: SamplerConfig,
+) -> Result<(), ()> {
+    warn_if_debug_profile();
     let max_new_tokens = parse_max_new_tokens(max_new_tokens, 32)?;
     let mut source = HfSource::new(default_hf_path());
     let tokenizer_asset = source.load_tokenizer().map_err(|error| {
@@ -314,8 +352,10 @@ fn chat_hf_with_prompt(
         model,
         tokenizer: Arc::new(tokenizer.clone()) as Arc<dyn Tokenizer>,
     };
+    let mut session_config = SessionConfig::default();
+    session_config.sampler = sampler;
     let mut session = engine
-        .create_session(&artifacts, SessionConfig::default())
+        .create_session(&artifacts, session_config.clone())
         .map_err(|error| {
             eprintln!("failed to create inference session: {}", error);
         })?;
@@ -327,6 +367,17 @@ fn chat_hf_with_prompt(
     println!("model path: {}", default_hf_path());
     println!("system prompt path: {}", system_prompt_path);
     println!("max new tokens per turn: {}", max_new_tokens);
+    if session_config.sampler.is_greedy() {
+        println!("sampler: greedy");
+    } else {
+        println!(
+            "sampler: temperature={:.2} top_k={} top_p={:.2} seed={}",
+            session_config.sampler.temperature,
+            session_config.sampler.top_k,
+            session_config.sampler.top_p,
+            session_config.sampler.seed
+        );
+    }
     println!("model load elapsed: {:.3?}", load_elapsed);
     println!("commands: /reset /stats /exit");
 
@@ -382,7 +433,7 @@ fn chat_hf_with_prompt(
 
         println!();
         println!(
-            "turn stats: reused_prompt_tokens={} appended_prompt_tokens={} generated_tokens={} finish={:?} render={:.3?} tokenize={:.3?} sync={:.3?} decode={:.3?}",
+            "turn stats: reused_prompt_tokens={} appended_prompt_tokens={} generated_tokens={} finish={:?} render={:.3?} tokenize={:.3?} sync={:.3?} prefill_tok_s={:.2} decode={:.3?} decode_tok_s={:.2}",
             turn.reused_prompt_tokens,
             turn.appended_prompt_tokens,
             turn.generated_tokens,
@@ -390,7 +441,9 @@ fn chat_hf_with_prompt(
             turn.render_elapsed,
             turn.tokenize_elapsed,
             turn.sync_elapsed,
-            turn.decode_elapsed
+            throughput_per_second(turn.appended_prompt_tokens, turn.sync_elapsed),
+            turn.decode_elapsed,
+            throughput_per_second(turn.generated_tokens, turn.decode_elapsed),
         );
     }
 
@@ -529,6 +582,7 @@ fn stream_reference_tokens_with_fallback_stop(
     let generation_budget = max_new_tokens.min(session.config().max_generated_tokens);
     let mut generated_tokens = Vec::with_capacity(generation_budget);
     let mut displayed_text = String::new();
+    let mut pending_bytes = Vec::new();
     let mut finish_reason = if generation_budget < max_new_tokens {
         GenerationFinishReason::SessionLimit
     } else {
@@ -546,56 +600,72 @@ fn stream_reference_tokens_with_fallback_stop(
         })?;
         generated_tokens.push(sample);
 
-        let assistant_token_ids = assistant_display_token_ids(&generated_tokens, stop_config);
-        let decoded = tokenizer.decode(&assistant_token_ids).map_err(|error| {
-            eprintln!("failed to decode assistant tokens: {}", error);
-        })?;
-        if let Some(delta) = decoded.strip_prefix(&displayed_text) {
-            if !delta.is_empty() {
-                print!("{delta}");
-                io::stdout().flush().map_err(|error| {
-                    eprintln!("failed to flush stdout: {}", error);
-                })?;
-            }
-        } else if decoded != displayed_text {
-            print!("\n[decode resync]\n{decoded}");
-            io::stdout().flush().map_err(|error| {
-                eprintln!("failed to flush stdout: {}", error);
-            })?;
-        }
-        displayed_text = decoded;
-
-        if stop_config
-            .primary_stop_token_id
-            .is_some_and(|stop| stop == sample.token_id)
-            || stop_config
-                .fallback_stop_token_id
-                .is_some_and(|stop| stop == sample.token_id)
-        {
+        if is_chat_stop_token(sample.token_id, stop_config) {
             finish_reason = GenerationFinishReason::StopToken;
             break;
         }
+
+        let token_bytes = tokenizer.decode_token_bytes(sample.token_id).map_err(|error| {
+            eprintln!("failed to decode assistant token bytes: {}", error);
+        })?;
+        pending_bytes.extend_from_slice(&token_bytes);
+        flush_streamable_utf8(&mut pending_bytes, &mut displayed_text)?;
     }
 
     Ok((generated_tokens, displayed_text, finish_reason))
 }
 
-fn assistant_display_token_ids(samples: &[TokenSample], stop_config: &ChatStopConfig) -> Vec<u32> {
-    let mut token_ids = samples
-        .iter()
-        .map(|sample| sample.token_id)
-        .collect::<Vec<_>>();
-    if token_ids.last().copied().is_some_and(|token_id| {
-        stop_config
-            .primary_stop_token_id
+fn is_chat_stop_token(token_id: u32, stop_config: &ChatStopConfig) -> bool {
+    stop_config
+        .primary_stop_token_id
+        .is_some_and(|stop| stop == token_id)
+        || stop_config
+            .fallback_stop_token_id
             .is_some_and(|stop| stop == token_id)
-            || stop_config
-                .fallback_stop_token_id
-                .is_some_and(|stop| stop == token_id)
-    }) {
-        token_ids.pop();
+}
+
+fn flush_streamable_utf8(pending_bytes: &mut Vec<u8>, displayed_text: &mut String) -> Result<(), ()> {
+    let delta = take_valid_utf8_prefix(pending_bytes).map_err(|error| {
+        eprintln!("assistant stream decode failed: {}", error);
+    })?;
+    if delta.is_empty() {
+        return Ok(());
     }
-    token_ids
+
+    print!("{delta}");
+    io::stdout().flush().map_err(|error| {
+        eprintln!("failed to flush stdout: {}", error);
+    })?;
+    displayed_text.push_str(&delta);
+    Ok(())
+}
+
+fn take_valid_utf8_prefix(bytes: &mut Vec<u8>) -> Result<String, String> {
+    if bytes.is_empty() {
+        return Ok(String::new());
+    }
+
+    match std::str::from_utf8(bytes) {
+        Ok(text) => {
+            let prefix = text.to_string();
+            bytes.clear();
+            Ok(prefix)
+        }
+        Err(error) if error.error_len().is_none() => {
+            let valid_up_to = error.valid_up_to();
+            if valid_up_to == 0 {
+                return Ok(String::new());
+            }
+
+            let prefix_bytes = bytes.drain(..valid_up_to).collect::<Vec<_>>();
+            String::from_utf8(prefix_bytes)
+                .map_err(|utf8_error| format!("valid UTF-8 prefix could not be reconstructed: {utf8_error}"))
+        }
+        Err(error) => Err(format!(
+            "invalid UTF-8 sequence while streaming assistant output at byte {}",
+            error.valid_up_to()
+        )),
+    }
 }
 
 fn render_chat_hf(text: Option<&str>) -> Result<(), ()> {
@@ -658,6 +728,7 @@ fn smoke_hf_with_prompt(
     text: Option<&str>,
     system_prompt_path: &str,
 ) -> Result<(), ()> {
+    warn_if_debug_profile();
     let user_text = text.unwrap_or("请只回复一个词：OK");
     let report = run_reference_generation(engine, user_text, 1, system_prompt_path)?;
 
@@ -706,6 +777,7 @@ fn generate_hf_with_prompt(
     max_new_tokens: Option<&str>,
     system_prompt_path: &str,
 ) -> Result<(), ()> {
+    warn_if_debug_profile();
     let user_text = text.unwrap_or("请用一句话概括这份 system prompt 的核心限制。");
     let max_new_tokens = parse_max_new_tokens(max_new_tokens, 4)?;
     let report = run_reference_generation(engine, user_text, max_new_tokens, system_prompt_path)?;
@@ -749,6 +821,7 @@ fn profile_hf_with_prompt(
     max_new_tokens: Option<&str>,
     system_prompt_path: &str,
 ) -> Result<(), ()> {
+    warn_if_debug_profile();
     let user_text = text.unwrap_or("请只回复一个词：OK");
     let max_new_tokens = parse_max_new_tokens_allow_zero(max_new_tokens, 1)?;
     let report =
@@ -770,7 +843,15 @@ fn profile_hf_with_prompt(
         report.session_create_elapsed
     );
     println!("prefill elapsed: {:.3?}", report.prefill_elapsed);
+    println!(
+        "prefill tok/s: {:.2}",
+        throughput_per_second(report.prompt_token_ids.len(), report.prefill_elapsed)
+    );
     println!("decode elapsed: {:.3?}", report.decode_elapsed);
+    println!(
+        "decode tok/s: {:.2}",
+        throughput_per_second(report.generated_tokens.len(), report.decode_elapsed)
+    );
     println!("total elapsed: {:.3?}", report.total_elapsed);
     println!("generation finish reason: {:?}", report.finish_reason);
     println!(
@@ -997,6 +1078,22 @@ fn step_reference_tokens(
     Ok((generated_tokens, finish_reason))
 }
 
+fn warn_if_debug_profile() {
+    if cfg!(debug_assertions) {
+        eprintln!(
+            "warning: ferrisinfer-cli is running in the debug profile; CPU inference is much slower here. Use `cargo run --release -p ferrisinfer-cli -- <command>` for meaningful timing."
+        );
+    }
+}
+
+fn throughput_per_second(tokens: usize, elapsed: std::time::Duration) -> f64 {
+    let seconds = elapsed.as_secs_f64();
+    if seconds <= f64::EPSILON {
+        return 0.0;
+    }
+    tokens as f64 / seconds
+}
+
 fn load_default_hf_tokenizer() -> Result<VocabularyTokenizer, ()> {
     let mut source = HfSource::new(default_hf_path());
     let asset = source.load_tokenizer().map_err(|error| {
@@ -1130,22 +1227,16 @@ mod tests {
     }
 
     #[test]
-    fn assistant_display_token_ids_strips_terminal_stop_token() {
-        let stop_config = ChatStopConfig {
-            primary_stop_token_id: Some(42),
-            fallback_stop_token_id: Some(99),
-        };
-        let samples = vec![
-            TokenSample {
-                token_id: 1,
-                probability: 0.6,
-            },
-            TokenSample {
-                token_id: 42,
-                probability: 0.4,
-            },
-        ];
+    fn take_valid_utf8_prefix_buffers_incomplete_multibyte_sequence() {
+        let mut bytes = vec![0xE5, 0x8A];
+        assert_eq!(take_valid_utf8_prefix(&mut bytes).unwrap(), "");
+        assert_eq!(bytes, vec![0xE5, 0x8A]);
+    }
 
-        assert_eq!(assistant_display_token_ids(&samples, &stop_config), vec![1]);
+    #[test]
+    fn take_valid_utf8_prefix_flushes_completed_multibyte_sequence() {
+        let mut bytes = vec![0xE5, 0x8A, 0xA9, b' ', b'A'];
+        assert_eq!(take_valid_utf8_prefix(&mut bytes).unwrap(), "助 A");
+        assert!(bytes.is_empty());
     }
 }

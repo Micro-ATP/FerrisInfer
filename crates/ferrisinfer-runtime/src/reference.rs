@@ -3,7 +3,9 @@ use ferrisinfer_kernel::cpu::attention::{
     causal_self_attention_f32, decode_causal_attention_f32, embedding_gather_f32, rope_f32,
 };
 use ferrisinfer_kernel::cpu::elementwise::{add_f32_in_place, mul_f32_in_place, silu_f32_in_place};
-use ferrisinfer_kernel::cpu::matmul::matmul_f32;
+use ferrisinfer_kernel::cpu::matmul::{
+    matmul_f32, matmul_rhs_transposed_argmax_f32, matmul_rhs_transposed_f32,
+};
 use ferrisinfer_kernel::cpu::reduction::rms_norm_f32;
 use ferrisinfer_model::{ActivationKind, AttentionLayout, DecoderOnlyModel, ModelConfig, NormKind};
 
@@ -38,6 +40,41 @@ pub struct ReferenceBlockConfig {
     pub rms_norm_epsilon: f32,
     pub rope_theta: f32,
     pub rotary_dims: usize,
+}
+
+pub(crate) struct DecodeWorkspace {
+    hidden: Tensor,
+    normed: Tensor,
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    attention: Tensor,
+    gated_product: Tensor,
+    gate_projection: Tensor,
+    logits: Tensor,
+}
+
+impl DecodeWorkspace {
+    pub(crate) fn new(config: &ModelConfig) -> Result<Self> {
+        let hidden_size = config.hidden_size;
+        let kv_hidden_size = config.num_key_value_heads * config.head_dim();
+
+        Ok(Self {
+            hidden: zeros_2d(1, hidden_size)?,
+            normed: zeros_2d(1, hidden_size)?,
+            query: zeros_2d(1, hidden_size)?,
+            key: zeros_2d(1, kv_hidden_size)?,
+            value: zeros_2d(1, kv_hidden_size)?,
+            attention: zeros_2d(1, hidden_size)?,
+            gated_product: zeros_2d(1, config.intermediate_size)?,
+            gate_projection: zeros_2d(1, config.intermediate_size)?,
+            logits: zeros_2d(1, config.vocab_size)?,
+        })
+    }
+
+    pub(crate) fn logits(&self) -> &Tensor {
+        &self.logits
+    }
 }
 
 pub fn decoder_block_forward_f32(
@@ -306,73 +343,91 @@ pub fn decoder_model_token_logits_with_kv_cache_f32(
     kv_cache: &mut KvCache,
     position: usize,
 ) -> Result<Tensor> {
-    validate_supported_reference_model(model.config())?;
-
-    let config = model.config();
-    let embedding = get_weight(model, "tok_embeddings.weight")?;
-    let mut hidden = zeros_2d(1, config.hidden_size)?;
-    embedding_gather_f32(embedding, &[token_id], &mut hidden)?;
-
-    for layer in 0..config.num_layers {
-        let weights = block_weights(model, layer)?;
-        hidden = decoder_block_decode_step_f32(
-            &hidden,
-            &weights,
-            block_config(config),
-            kv_cache,
-            layer,
-            position,
-        )?;
-    }
-
-    let mut normalized = zeros_2d(1, config.hidden_size)?;
-    rms_norm_f32(
-        &hidden,
-        get_weight(model, "norm.weight")?,
-        &mut normalized,
-        config.norm.epsilon,
+    let mut workspace = DecodeWorkspace::new(model.config())?;
+    decoder_model_token_logits_with_kv_cache_buffered_f32(
+        model,
+        token_id,
+        kv_cache,
+        position,
+        &mut workspace,
     )?;
-
-    let output_weight = output_weight(model)?;
-    let mut logits = zeros_2d(1, config.vocab_size)?;
-    linear_right_transposed_f32(&normalized, output_weight, &mut logits)?;
-    Ok(logits)
+    Ok(workspace.logits)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn decoder_model_token_sample_with_kv_cache_f32(
     model: &DecoderOnlyModel,
     token_id: u32,
     kv_cache: &mut KvCache,
     position: usize,
 ) -> Result<TokenSample> {
+    let mut workspace = DecodeWorkspace::new(model.config())?;
+    decoder_model_token_sample_with_kv_cache_buffered_f32(
+        model,
+        token_id,
+        kv_cache,
+        position,
+        &mut workspace,
+    )
+}
+
+pub(crate) fn decoder_model_token_logits_with_kv_cache_buffered_f32(
+    model: &DecoderOnlyModel,
+    token_id: u32,
+    kv_cache: &mut KvCache,
+    position: usize,
+    workspace: &mut DecodeWorkspace,
+) -> Result<()> {
     validate_supported_reference_model(model.config())?;
 
     let config = model.config();
-    let embedding = get_weight(model, "tok_embeddings.weight")?;
-    let mut hidden = zeros_2d(1, config.hidden_size)?;
-    embedding_gather_f32(embedding, &[token_id], &mut hidden)?;
+    decoder_model_token_hidden_with_kv_cache_buffered_f32(
+        model,
+        token_id,
+        kv_cache,
+        position,
+        workspace,
+    )?;
 
-    for layer in 0..config.num_layers {
-        let weights = block_weights(model, layer)?;
-        hidden = decoder_block_decode_step_f32(
-            &hidden,
-            &weights,
-            block_config(config),
-            kv_cache,
-            layer,
-            position,
-        )?;
-    }
-
-    let mut normalized = zeros_2d(1, config.hidden_size)?;
     rms_norm_f32(
-        &hidden,
+        &workspace.hidden,
         get_weight(model, "norm.weight")?,
-        &mut normalized,
+        &mut workspace.normed,
+        config.norm.epsilon,
+    )?;
+    linear_right_transposed_f32(
+        &workspace.normed,
+        output_weight(model)?,
+        &mut workspace.logits,
+    )
+}
+
+pub(crate) fn decoder_model_token_sample_with_kv_cache_buffered_f32(
+    model: &DecoderOnlyModel,
+    token_id: u32,
+    kv_cache: &mut KvCache,
+    position: usize,
+    workspace: &mut DecodeWorkspace,
+) -> Result<TokenSample> {
+    validate_supported_reference_model(model.config())?;
+
+    let config = model.config();
+    decoder_model_token_hidden_with_kv_cache_buffered_f32(
+        model,
+        token_id,
+        kv_cache,
+        position,
+        workspace,
+    )?;
+
+    rms_norm_f32(
+        &workspace.hidden,
+        get_weight(model, "norm.weight")?,
+        &mut workspace.normed,
         config.norm.epsilon,
     )?;
 
-    linear_right_transposed_argmax_f32(&normalized, output_weight(model)?)
+    linear_right_transposed_argmax_f32(&workspace.normed, output_weight(model)?)
 }
 
 fn decoder_model_hidden_f32(model: &DecoderOnlyModel, token_ids: &[u32]) -> Result<Tensor> {
@@ -405,6 +460,203 @@ fn decoder_model_hidden_f32(model: &DecoderOnlyModel, token_ids: &[u32]) -> Resu
     Ok(normalized)
 }
 
+fn decoder_model_token_hidden_with_kv_cache_buffered_f32(
+    model: &DecoderOnlyModel,
+    token_id: u32,
+    kv_cache: &mut KvCache,
+    position: usize,
+    workspace: &mut DecodeWorkspace,
+) -> Result<()> {
+    let config = model.config();
+    let hidden_size = config.hidden_size;
+    let kv_hidden_size = config.num_key_value_heads * config.head_dim();
+
+    workspace.hidden.reshape_in_place(Shape::from_slice(&[1, hidden_size])?)?;
+    workspace.normed.reshape_in_place(Shape::from_slice(&[1, hidden_size])?)?;
+    workspace.query.reshape_in_place(Shape::from_slice(&[1, hidden_size])?)?;
+    workspace
+        .key
+        .reshape_in_place(Shape::from_slice(&[1, kv_hidden_size])?)?;
+    workspace
+        .value
+        .reshape_in_place(Shape::from_slice(&[1, kv_hidden_size])?)?;
+    workspace
+        .attention
+        .reshape_in_place(Shape::from_slice(&[1, hidden_size])?)?;
+
+    let embedding = get_weight(model, "tok_embeddings.weight")?;
+    embedding_gather_f32(embedding, &[token_id], &mut workspace.hidden)?;
+
+    for layer in 0..config.num_layers {
+        let weights = block_weights(model, layer)?;
+        decoder_block_decode_step_buffered_f32(
+            &weights,
+            block_config(config),
+            kv_cache,
+            layer,
+            position,
+            workspace,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn decoder_block_decode_step_buffered_f32(
+    weights: &ReferenceDecoderBlockWeights<'_>,
+    config: ReferenceBlockConfig,
+    kv_cache: &mut KvCache,
+    layer_index: usize,
+    position: usize,
+    workspace: &mut DecodeWorkspace,
+) -> Result<()> {
+    let hidden_size = config.num_heads * config.head_dim;
+    let kv_hidden_size = config.num_kv_heads * config.head_dim;
+
+    workspace.hidden.ensure_dtype(DType::F32)?;
+    workspace.hidden.ensure_contiguous()?;
+    if workspace.hidden.shape().dims() != [1, hidden_size] {
+        return Err(FerrisError::new(
+            ErrorKind::InvalidShape,
+            "decode workspace hidden state must have shape [1, hidden_size]",
+        ));
+    }
+
+    workspace.normed.reshape_in_place(Shape::from_slice(&[1, hidden_size])?)?;
+    rms_norm_f32(
+        &workspace.hidden,
+        weights.attention_norm,
+        &mut workspace.normed,
+        config.rms_norm_epsilon,
+    )?;
+
+    workspace.query.reshape_in_place(Shape::from_slice(&[1, hidden_size])?)?;
+    workspace
+        .key
+        .reshape_in_place(Shape::from_slice(&[1, kv_hidden_size])?)?;
+    workspace
+        .value
+        .reshape_in_place(Shape::from_slice(&[1, kv_hidden_size])?)?;
+    linear_f32_with_bias(
+        &workspace.normed,
+        weights.wq,
+        weights.wq_bias,
+        &mut workspace.query,
+    )?;
+    linear_f32_with_bias(
+        &workspace.normed,
+        weights.wk,
+        weights.wk_bias,
+        &mut workspace.key,
+    )?;
+    linear_f32_with_bias(
+        &workspace.normed,
+        weights.wv,
+        weights.wv_bias,
+        &mut workspace.value,
+    )?;
+
+    workspace
+        .query
+        .reshape_in_place(Shape::from_slice(&[1, config.num_heads, config.head_dim])?)?;
+    workspace
+        .key
+        .reshape_in_place(Shape::from_slice(&[1, config.num_kv_heads, config.head_dim])?)?;
+    workspace
+        .value
+        .reshape_in_place(Shape::from_slice(&[1, config.num_kv_heads, config.head_dim])?)?;
+    rope_f32(
+        &mut workspace.query,
+        &mut workspace.key,
+        position,
+        config.rotary_dims,
+        config.rope_theta,
+    )?;
+
+    workspace
+        .key
+        .reshape_in_place(Shape::from_slice(&[config.num_kv_heads, config.head_dim])?)?;
+    workspace
+        .value
+        .reshape_in_place(Shape::from_slice(&[config.num_kv_heads, config.head_dim])?)?;
+
+    let cache_layer = kv_cache.layer(layer_index)?;
+    workspace
+        .attention
+        .reshape_in_place(Shape::from_slice(&[1, config.num_heads, config.head_dim])?)?;
+    decode_causal_attention_f32(
+        &workspace.query,
+        cache_layer.key(),
+        cache_layer.value(),
+        position,
+        &workspace.key,
+        &workspace.value,
+        &mut workspace.attention,
+    )?;
+    kv_cache.write_uncommitted_f32(layer_index, position, &workspace.key, &workspace.value)?;
+
+    workspace
+        .query
+        .reshape_in_place(Shape::from_slice(&[1, hidden_size])?)?;
+    workspace
+        .key
+        .reshape_in_place(Shape::from_slice(&[1, kv_hidden_size])?)?;
+    workspace
+        .value
+        .reshape_in_place(Shape::from_slice(&[1, kv_hidden_size])?)?;
+    workspace
+        .attention
+        .reshape_in_place(Shape::from_slice(&[1, hidden_size])?)?;
+
+    linear_f32_with_bias(
+        &workspace.attention,
+        weights.wo,
+        weights.wo_bias,
+        &mut workspace.normed,
+    )?;
+    add_f32_in_place(&mut workspace.normed, &workspace.hidden)?;
+
+    rms_norm_f32(
+        &workspace.normed,
+        weights.ffn_norm,
+        &mut workspace.attention,
+        config.rms_norm_epsilon,
+    )?;
+
+    workspace
+        .gated_product
+        .reshape_in_place(Shape::from_slice(&[1, config.intermediate_size])?)?;
+    workspace
+        .gate_projection
+        .reshape_in_place(Shape::from_slice(&[1, config.intermediate_size])?)?;
+    linear_f32_with_bias(
+        &workspace.attention,
+        weights.w1,
+        weights.w1_bias,
+        &mut workspace.gated_product,
+    )?;
+    linear_f32_with_bias(
+        &workspace.attention,
+        weights.w3,
+        weights.w3_bias,
+        &mut workspace.gate_projection,
+    )?;
+
+    silu_f32_in_place(&mut workspace.gate_projection)?;
+    mul_f32_in_place(&mut workspace.gated_product, &workspace.gate_projection)?;
+
+    workspace.hidden.reshape_in_place(Shape::from_slice(&[1, hidden_size])?)?;
+    linear_f32_with_bias(
+        &workspace.gated_product,
+        weights.w2,
+        weights.w2_bias,
+        &mut workspace.hidden,
+    )?;
+    add_f32_in_place(&mut workspace.hidden, &workspace.normed)?;
+    Ok(())
+}
+
+#[allow(dead_code)]
 fn decoder_block_decode_step_f32(
     input: &Tensor,
     weights: &ReferenceDecoderBlockWeights<'_>,
@@ -625,6 +877,7 @@ fn get_optional_weight<'a>(model: &'a DecoderOnlyModel, name: &str) -> Option<&'
     model.weights().get(name)
 }
 
+#[allow(dead_code)]
 fn attention_slot_tensor_f32(
     tensor: Tensor,
     num_kv_heads: usize,
@@ -747,279 +1000,18 @@ fn linear_f32_with_bias(
 }
 
 fn linear_right_transposed_f32(input: &Tensor, weight: &Tensor, out: &mut Tensor) -> Result<()> {
-    input.ensure_dtype(DType::F32)?;
-    input.ensure_contiguous()?;
-    weight.ensure_dtype(DType::F32)?;
-    weight.ensure_contiguous()?;
-    out.ensure_dtype(DType::F32)?;
-    out.ensure_contiguous()?;
-
-    if input.shape().rank() != 2 || weight.shape().rank() != 2 || out.shape().rank() != 2 {
-        return Err(FerrisError::new(
-            ErrorKind::InvalidShape,
-            "linear_right_transposed_f32 requires rank-2 tensors",
-        ));
-    }
-
-    let input_dims = input.shape().dims();
-    let weight_dims = weight.shape().dims();
-    let out_dims = out.shape().dims();
-
-    let rows = input_dims[0];
-    let input_width = input_dims[1];
-    let out_width = weight_dims[0];
-
-    if weight_dims[1] != input_width || out_dims != [rows, out_width] {
-        return Err(FerrisError::new(
-            ErrorKind::InvalidShape,
-            "linear_right_transposed_f32 expects input [m, k], weight [n, k], output [m, n]",
-        ));
-    }
-
-    let input_values = input.as_f32_slice()?;
-    let weight_values = weight.as_f32_slice()?;
-    let out_values = out.as_f32_slice_mut()?;
-    let thread_count = preferred_transposed_linear_row_thread_count(rows, out_width, input_width);
-
-    if thread_count == 1 {
-        compute_linear_right_transposed_row_chunk(
-            &input_values,
-            &weight_values,
-            out_values,
-            input_width,
-            out_width,
-            0,
-            rows,
-        );
-    } else {
-        let rows_per_chunk = rows.div_ceil(thread_count);
-
-        std::thread::scope(|scope| {
-            for (chunk_index, out_chunk) in out_values
-                .chunks_mut(rows_per_chunk * out_width)
-                .enumerate()
-            {
-                let row_start = chunk_index * rows_per_chunk;
-                let row_end = (row_start + rows_per_chunk).min(rows);
-                let input_values = &input_values;
-                let weight_values = &weight_values;
-
-                scope.spawn(move || {
-                    compute_linear_right_transposed_row_chunk(
-                        input_values,
-                        weight_values,
-                        out_chunk,
-                        input_width,
-                        out_width,
-                        row_start,
-                        row_end,
-                    );
-                });
-            }
-        });
-    }
-
-    Ok(())
+    matmul_rhs_transposed_f32(input, weight, out)
 }
 
 fn linear_right_transposed_argmax_f32(input: &Tensor, weight: &Tensor) -> Result<TokenSample> {
-    input.ensure_dtype(DType::F32)?;
-    input.ensure_contiguous()?;
-    weight.ensure_dtype(DType::F32)?;
-    weight.ensure_contiguous()?;
-
-    if input.shape().rank() != 2 || weight.shape().rank() != 2 {
-        return Err(FerrisError::new(
-            ErrorKind::InvalidShape,
-            "linear_right_transposed_argmax_f32 requires rank-2 tensors",
-        ));
-    }
-
-    let input_dims = input.shape().dims();
-    let weight_dims = weight.shape().dims();
-    if input_dims[0] != 1 || weight_dims[1] != input_dims[1] {
-        return Err(FerrisError::new(
-            ErrorKind::InvalidShape,
-            "linear_right_transposed_argmax_f32 expects input [1, k] and weight [n, k]",
-        ));
-    }
-
-    let input_width = input_dims[1];
-    let out_width = weight_dims[0];
-    if out_width == 0 {
-        return Err(FerrisError::new(
-            ErrorKind::InvalidShape,
-            "linear_right_transposed_argmax_f32 requires a non-empty output width",
-        ));
-    }
-
-    let input_values = input.as_f32_slice()?;
-    let weight_values = weight.as_f32_slice()?;
-    let thread_count = preferred_transposed_linear_thread_count(1, out_width, input_width);
-
-    let aggregate = if thread_count == 1 {
-        compute_linear_right_transposed_argmax_chunk(
-            &input_values,
-            &weight_values,
-            input_width,
-            0,
-            out_width,
-        )
-    } else {
-        let cols_per_chunk = out_width.div_ceil(thread_count);
-
-        std::thread::scope(|scope| {
-            let mut handles = Vec::new();
-            for chunk_index in 0..thread_count {
-                let col_start = chunk_index * cols_per_chunk;
-                if col_start >= out_width {
-                    break;
-                }
-
-                let col_end = (col_start + cols_per_chunk).min(out_width);
-                let input_values = &input_values;
-                let weight_values = &weight_values;
-
-                handles.push(scope.spawn(move || {
-                    compute_linear_right_transposed_argmax_chunk(
-                        input_values,
-                        weight_values,
-                        input_width,
-                        col_start,
-                        col_end,
-                    )
-                }));
-            }
-
-            let mut aggregate = None;
-            for handle in handles {
-                let chunk = handle.join().expect("scoped thread panicked");
-                aggregate = Some(match aggregate {
-                    Some(current) => merge_argmax_projection_chunks(current, chunk),
-                    None => chunk,
-                });
-            }
-
-            aggregate.expect("at least one argmax projection chunk")
-        })
-    };
+    let (best_index, probability) = matmul_rhs_transposed_argmax_f32(input, weight)?;
 
     Ok(TokenSample {
-        token_id: u32::try_from(aggregate.best_index).map_err(|_| {
+        token_id: u32::try_from(best_index).map_err(|_| {
             FerrisError::new(ErrorKind::Runtime, "best token index does not fit into u32")
         })?,
-        probability: 1.0 / aggregate.scaled_sum,
+        probability,
     })
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ArgmaxProjectionChunk {
-    best_index: usize,
-    max_logit: f32,
-    scaled_sum: f32,
-}
-
-fn compute_linear_right_transposed_argmax_chunk(
-    input_values: &[f32],
-    weight_values: &[f32],
-    input_width: usize,
-    col_start: usize,
-    col_end: usize,
-) -> ArgmaxProjectionChunk {
-    let mut best_index = col_start;
-    let mut max_logit = f32::NEG_INFINITY;
-    let mut scaled_sum = 0.0f32;
-
-    for out_col in col_start..col_end {
-        let mut sum = 0.0f32;
-        for inner in 0..input_width {
-            sum += input_values[inner] * weight_values[out_col * input_width + inner];
-        }
-
-        if sum > max_logit {
-            scaled_sum = if max_logit.is_finite() {
-                scaled_sum * (max_logit - sum).exp() + 1.0
-            } else {
-                1.0
-            };
-            max_logit = sum;
-            best_index = out_col;
-        } else {
-            scaled_sum += (sum - max_logit).exp();
-        }
-    }
-
-    ArgmaxProjectionChunk {
-        best_index,
-        max_logit,
-        scaled_sum,
-    }
-}
-
-fn merge_argmax_projection_chunks(
-    left: ArgmaxProjectionChunk,
-    right: ArgmaxProjectionChunk,
-) -> ArgmaxProjectionChunk {
-    if left.max_logit >= right.max_logit {
-        ArgmaxProjectionChunk {
-            best_index: left.best_index,
-            max_logit: left.max_logit,
-            scaled_sum: left.scaled_sum
-                + right.scaled_sum * (right.max_logit - left.max_logit).exp(),
-        }
-    } else {
-        ArgmaxProjectionChunk {
-            best_index: right.best_index,
-            max_logit: right.max_logit,
-            scaled_sum: right.scaled_sum
-                + left.scaled_sum * (left.max_logit - right.max_logit).exp(),
-        }
-    }
-}
-
-fn compute_linear_right_transposed_row_chunk(
-    input_values: &[f32],
-    weight_values: &[f32],
-    out_chunk: &mut [f32],
-    input_width: usize,
-    out_width: usize,
-    row_start: usize,
-    row_end: usize,
-) {
-    for (local_row, row) in (row_start..row_end).enumerate() {
-        let input_row = &input_values[row * input_width..(row + 1) * input_width];
-        let out_row = &mut out_chunk[local_row * out_width..(local_row + 1) * out_width];
-
-        for out_col in 0..out_width {
-            let mut sum = 0.0f32;
-            let weight_row = &weight_values[out_col * input_width..(out_col + 1) * input_width];
-            for (input_value, weight_value) in input_row.iter().zip(weight_row.iter()) {
-                sum += input_value * weight_value;
-            }
-            out_row[out_col] = sum;
-        }
-    }
-}
-
-fn preferred_transposed_linear_row_thread_count(
-    rows: usize,
-    out_width: usize,
-    input_width: usize,
-) -> usize {
-    const MIN_PARALLEL_WORK: usize = 131_072;
-
-    if rows < 2 {
-        return 1;
-    }
-
-    let total_work = rows.saturating_mul(out_width).saturating_mul(input_width);
-    if total_work < MIN_PARALLEL_WORK {
-        return 1;
-    }
-
-    std::thread::available_parallelism()
-        .map(|parallelism| parallelism.get().min(rows))
-        .unwrap_or(1)
 }
 
 fn preferred_bias_add_thread_count(rows: usize, cols: usize) -> usize {
@@ -1032,27 +1024,6 @@ fn preferred_bias_add_thread_count(rows: usize, cols: usize) -> usize {
 
     std::thread::available_parallelism()
         .map(|parallelism| parallelism.get().min(rows))
-        .unwrap_or(1)
-}
-
-fn preferred_transposed_linear_thread_count(
-    rows: usize,
-    out_width: usize,
-    input_width: usize,
-) -> usize {
-    const MIN_PARALLEL_WORK: usize = 131_072;
-
-    if out_width < 2 {
-        return 1;
-    }
-
-    let total_work = rows.saturating_mul(out_width).saturating_mul(input_width);
-    if total_work < MIN_PARALLEL_WORK {
-        return 1;
-    }
-
-    std::thread::available_parallelism()
-        .map(|parallelism| parallelism.get().min(out_width))
         .unwrap_or(1)
 }
 

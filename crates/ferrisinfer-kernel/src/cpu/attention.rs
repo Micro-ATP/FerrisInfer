@@ -394,6 +394,8 @@ pub fn decode_causal_attention_f32(
     let query_values = query.as_f32_slice()?;
     let key_slot_values = key_slot.as_f32_slice()?;
     let value_slot_values = value_slot.as_f32_slice()?;
+    let cached_key_values = cached_key.as_f32_slice().ok();
+    let cached_value_values = cached_value.as_f32_slice().ok();
     let cached_key_bytes = cached_key.as_bytes();
     let cached_value_bytes = cached_value.as_bytes();
     let queries_per_kv_head = num_query_heads / num_kv_heads;
@@ -403,21 +405,41 @@ pub fn decode_causal_attention_f32(
     let thread_count =
         preferred_decode_attention_thread_count(num_query_heads, head_dim, cache_len + 1);
     if thread_count == 1 {
-        compute_decode_attention_head_chunk(
-            &query_values,
-            cached_key_bytes,
-            cached_value_bytes,
-            &key_slot_values,
-            &value_slot_values,
-            out_values,
-            0,
-            num_query_heads,
-            cache_len,
-            num_kv_heads,
-            queries_per_kv_head,
-            head_dim,
-            scale,
-        );
+        if let (Some(cached_key_values), Some(cached_value_values)) =
+            (cached_key_values, cached_value_values)
+        {
+            compute_decode_attention_head_chunk_f32(
+                &query_values,
+                cached_key_values,
+                cached_value_values,
+                &key_slot_values,
+                &value_slot_values,
+                out_values,
+                0,
+                num_query_heads,
+                cache_len,
+                num_kv_heads,
+                queries_per_kv_head,
+                head_dim,
+                scale,
+            );
+        } else {
+            compute_decode_attention_head_chunk_packed(
+                &query_values,
+                cached_key_bytes,
+                cached_value_bytes,
+                &key_slot_values,
+                &value_slot_values,
+                out_values,
+                0,
+                num_query_heads,
+                cache_len,
+                num_kv_heads,
+                queries_per_kv_head,
+                head_dim,
+                scale,
+            );
+        }
     } else {
         let heads_per_chunk = num_query_heads.div_ceil(thread_count);
         let chunk_width = heads_per_chunk * head_dim;
@@ -429,23 +451,45 @@ pub fn decode_causal_attention_f32(
                 let query_values = &query_values;
                 let key_slot_values = &key_slot_values;
                 let value_slot_values = &value_slot_values;
+                let cached_key_values = cached_key_values;
+                let cached_value_values = cached_value_values;
 
                 scope.spawn(move || {
-                    compute_decode_attention_head_chunk(
-                        query_values,
-                        cached_key_bytes,
-                        cached_value_bytes,
-                        key_slot_values,
-                        value_slot_values,
-                        out_chunk,
-                        head_start,
-                        head_end,
-                        cache_len,
-                        num_kv_heads,
-                        queries_per_kv_head,
-                        head_dim,
-                        scale,
-                    );
+                    if let (Some(cached_key_values), Some(cached_value_values)) =
+                        (cached_key_values, cached_value_values)
+                    {
+                        compute_decode_attention_head_chunk_f32(
+                            query_values,
+                            cached_key_values,
+                            cached_value_values,
+                            key_slot_values,
+                            value_slot_values,
+                            out_chunk,
+                            head_start,
+                            head_end,
+                            cache_len,
+                            num_kv_heads,
+                            queries_per_kv_head,
+                            head_dim,
+                            scale,
+                        );
+                    } else {
+                        compute_decode_attention_head_chunk_packed(
+                            query_values,
+                            cached_key_bytes,
+                            cached_value_bytes,
+                            key_slot_values,
+                            value_slot_values,
+                            out_chunk,
+                            head_start,
+                            head_end,
+                            cache_len,
+                            num_kv_heads,
+                            queries_per_kv_head,
+                            head_dim,
+                            scale,
+                        );
+                    }
                 });
             }
         });
@@ -549,7 +593,70 @@ fn compute_attention_chunk(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn compute_decode_attention_head_chunk(
+fn compute_decode_attention_head_chunk_f32(
+    query_values: &[f32],
+    cached_key_values: &[f32],
+    cached_value_values: &[f32],
+    key_slot_values: &[f32],
+    value_slot_values: &[f32],
+    out_chunk: &mut [f32],
+    head_start: usize,
+    head_end: usize,
+    cache_len: usize,
+    num_kv_heads: usize,
+    queries_per_kv_head: usize,
+    head_dim: usize,
+    scale: f32,
+) {
+    for (local_head_index, query_head) in (head_start..head_end).enumerate() {
+        let kv_head = query_head / queries_per_kv_head;
+        let query_base = query_head * head_dim;
+        let slot_base = kv_head * head_dim;
+        let query_row = &query_values[query_base..query_base + head_dim];
+        let out_base = local_head_index * head_dim;
+        let out_row = &mut out_chunk[out_base..out_base + head_dim];
+        out_row.fill(0.0);
+        let mut max_score = f32::NEG_INFINITY;
+        let mut score_sum = 0.0f32;
+
+        for attended_position in 0..cache_len {
+            let score = dot_product_with_values(
+                query_row,
+                cached_key_values,
+                attended_position,
+                kv_head,
+                num_kv_heads,
+                head_dim,
+            ) * scale;
+            let weight =
+                update_online_softmax_accumulator(out_row, &mut max_score, &mut score_sum, score);
+            accumulate_weighted_values_from_cache(
+                out_row,
+                cached_value_values,
+                attended_position,
+                kv_head,
+                num_kv_heads,
+                head_dim,
+                weight,
+            );
+        }
+
+        let slot_row = &key_slot_values[slot_base..slot_base + head_dim];
+        let slot_score = dot_product(query_row, slot_row) * scale;
+        let slot_weight =
+            update_online_softmax_accumulator(out_row, &mut max_score, &mut score_sum, slot_score);
+        let slot_value_row = &value_slot_values[slot_base..slot_base + head_dim];
+        accumulate_weighted_values(out_row, slot_value_row, slot_weight);
+
+        let inv_score_sum = 1.0 / score_sum;
+        for value in out_row.iter_mut() {
+            *value *= inv_score_sum;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_decode_attention_head_chunk_packed(
     query_values: &[f32],
     cached_key_bytes: &[u8],
     cached_value_bytes: &[u8],
@@ -618,6 +725,18 @@ fn dot_product(lhs: &[f32], rhs: &[f32]) -> f32 {
         .sum()
 }
 
+fn dot_product_with_values(
+    query_row: &[f32],
+    values: &[f32],
+    position: usize,
+    head: usize,
+    num_heads: usize,
+    head_dim: usize,
+) -> f32 {
+    let start = attention_index(position, head, 0, num_heads, head_dim);
+    dot_product(query_row, &values[start..start + head_dim])
+}
+
 fn dot_product_with_packed_values(
     query_row: &[f32],
     packed_values: &[u8],
@@ -664,6 +783,19 @@ fn accumulate_weighted_values(out_row: &mut [f32], value_row: &[f32], weight: f3
     for (out_value, value) in out_row.iter_mut().zip(value_row.iter().copied()) {
         *out_value += weight * value;
     }
+}
+
+fn accumulate_weighted_values_from_cache(
+    out_row: &mut [f32],
+    values: &[f32],
+    position: usize,
+    head: usize,
+    num_heads: usize,
+    head_dim: usize,
+    weight: f32,
+) {
+    let start = attention_index(position, head, 0, num_heads, head_dim);
+    accumulate_weighted_values(out_row, &values[start..start + head_dim], weight);
 }
 
 fn accumulate_weighted_packed_values(
@@ -749,38 +881,45 @@ fn apply_rope_pair_in_place(
     rotary_dims: usize,
     theta: f32,
 ) {
-    let inverse_frequencies = (0..rotary_dims)
-        .step_by(2)
-        .map(|dim| 1.0 / theta.powf(dim as f32 / head_dim as f32))
-        .collect::<Vec<_>>();
+    let rotary_pairs = rotary_dims / 2;
+    let inverse_frequency_step = theta.powf(-2.0 / head_dim as f32);
 
     for position in 0..seq_len {
         let absolute_position = (position_offset + position) as f32;
+        let mut inverse_frequency = 1.0f32;
 
-        for (pair_index, inverse_frequency) in inverse_frequencies.iter().copied().enumerate() {
-            let dim = pair_index * 2;
+        for pair_index in 0..rotary_pairs {
             let angle = absolute_position * inverse_frequency;
-            let cosine = angle.cos();
-            let sine = angle.sin();
+            let (sine, cosine) = angle.sin_cos();
+            let low_dim = pair_index;
+            let high_dim = pair_index + rotary_pairs;
 
             for head in 0..query_heads {
-                let base = ((position * query_heads + head) * head_dim) + dim;
-                rotate_pair(query_values, base, cosine, sine);
+                let base = (position * query_heads + head) * head_dim;
+                rotate_rope_half_pair(query_values, base + low_dim, base + high_dim, cosine, sine);
             }
 
             for head in 0..key_heads {
-                let base = ((position * key_heads + head) * head_dim) + dim;
-                rotate_pair(key_values, base, cosine, sine);
+                let base = (position * key_heads + head) * head_dim;
+                rotate_rope_half_pair(key_values, base + low_dim, base + high_dim, cosine, sine);
             }
+
+            inverse_frequency *= inverse_frequency_step;
         }
     }
 }
 
-fn rotate_pair(values: &mut [f32], base: usize, cosine: f32, sine: f32) {
-    let even = values[base];
-    let odd = values[base + 1];
-    values[base] = even * cosine - odd * sine;
-    values[base + 1] = even * sine + odd * cosine;
+fn rotate_rope_half_pair(
+    values: &mut [f32],
+    low_index: usize,
+    high_index: usize,
+    cosine: f32,
+    sine: f32,
+) {
+    let low = values[low_index];
+    let high = values[high_index];
+    values[low_index] = low * cosine - high * sine;
+    values[high_index] = high * cosine + low * sine;
 }
 
 #[cfg(test)]

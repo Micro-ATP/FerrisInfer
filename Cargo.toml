@@ -22,3 +22,6 @@ ferrisinfer-io = { path = "crates/ferrisinfer-io" }
 ferrisinfer-kernel = { path = "crates/ferrisinfer-kernel" }
 ferrisinfer-model = { path = "crates/ferrisinfer-model" }
 ferrisinfer-runtime = { path = "crates/ferrisinfer-runtime" }
+
+[profile.dev]
+opt-level = 2

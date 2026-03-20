@@ -235,7 +235,11 @@ impl BytePairTokenizerModel {
     }
 
     fn decode(&self, tokens: &[u32]) -> Result<String> {
-        let mut output = String::new();
+        Ok(String::from_utf8_lossy(&self.decode_bytes(tokens)?).into_owned())
+    }
+
+    fn decode_bytes(&self, tokens: &[u32]) -> Result<Vec<u8>> {
+        let mut output = Vec::new();
         let mut regular_bytes = Vec::new();
 
         for token_id in tokens {
@@ -245,7 +249,7 @@ impl BytePairTokenizerModel {
 
             if self.added_token_ids.contains(token_id) {
                 flush_regular_bytes(&mut output, &mut regular_bytes);
-                output.push_str(token);
+                output.extend_from_slice(token.as_bytes());
                 continue;
             }
 
@@ -413,6 +417,15 @@ impl VocabularyTokenizer {
     ) -> Result<String> {
         self.asset.render_chat(messages, add_generation_prompt)
     }
+
+    pub fn decode_token_bytes(&self, token_id: u32) -> Result<Vec<u8>> {
+        match self.asset.kind {
+            TokenizerKind::BytePair => self.asset.byte_pair_model()?.decode_bytes(&[token_id]),
+            TokenizerKind::SentencePiece => Err(FerrisError::unsupported(
+                "SentencePiece tokenizer byte decode is not implemented yet",
+            )),
+        }
+    }
 }
 
 impl Tokenizer for VocabularyTokenizer {
@@ -505,12 +518,12 @@ fn push_qwen2_message(rendered: &mut String, role: ChatRole, content: &str) {
     rendered.push_str("<|im_end|>\n");
 }
 
-fn flush_regular_bytes(output: &mut String, regular_bytes: &mut Vec<u8>) {
+fn flush_regular_bytes(output: &mut Vec<u8>, regular_bytes: &mut Vec<u8>) {
     if regular_bytes.is_empty() {
         return;
     }
 
-    output.push_str(&String::from_utf8_lossy(regular_bytes));
+    output.extend_from_slice(regular_bytes);
     regular_bytes.clear();
 }
 

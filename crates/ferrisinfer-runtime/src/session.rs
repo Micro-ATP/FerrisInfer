@@ -6,10 +6,11 @@ use ferrisinfer_model::DecoderOnlyModel;
 
 use crate::kv_cache::{KvCache, KvCacheConfig};
 use crate::reference::{
-    decoder_model_prefill_last_token_sample_with_kv_cache_f32,
-    decoder_model_token_sample_with_kv_cache_f32,
+    decoder_model_prefill_last_token_logits_with_kv_cache_f32,
+    decoder_model_prefill_last_token_sample_with_kv_cache_f32, decoder_model_token_logits_with_kv_cache_buffered_f32,
+    decoder_model_token_sample_with_kv_cache_buffered_f32, DecodeWorkspace,
 };
-use crate::sampler::{SamplerConfig, TokenSample};
+use crate::sampler::{sample_last_token, SamplerConfig, SamplerState, TokenSample};
 
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
@@ -80,6 +81,8 @@ pub struct Session {
     position: usize,
     token_history: Vec<u32>,
     last_sample: Option<TokenSample>,
+    sampler_state: SamplerState,
+    decode_workspace: DecodeWorkspace,
 }
 
 impl Session {
@@ -88,14 +91,19 @@ impl Session {
         tokenizer: Arc<dyn Tokenizer>,
         config: SessionConfig,
     ) -> Result<Self> {
-        let model_config = model.config();
-        let kv_cache = KvCache::new(KvCacheConfig {
-            num_layers: model_config.num_layers,
-            num_kv_heads: model_config.num_key_value_heads,
-            head_dim: model_config.head_dim(),
-            max_sequence_length: config.max_sequence_length,
-            dtype: DType::F32,
-        })?;
+        let sampler_seed = config.sampler.seed;
+        let (kv_cache, decode_workspace) = {
+            let model_config = model.config();
+            let kv_cache = KvCache::new(KvCacheConfig {
+                num_layers: model_config.num_layers,
+                num_kv_heads: model_config.num_key_value_heads,
+                head_dim: model_config.head_dim(),
+                max_sequence_length: config.max_sequence_length,
+                dtype: DType::F32,
+            })?;
+            let decode_workspace = DecodeWorkspace::new(model_config)?;
+            (kv_cache, decode_workspace)
+        };
 
         Ok(Self {
             config,
@@ -105,6 +113,8 @@ impl Session {
             position: 0,
             token_history: Vec::new(),
             last_sample: None,
+            sampler_state: SamplerState::new(sampler_seed),
+            decode_workspace,
         })
     }
 
@@ -133,6 +143,7 @@ impl Session {
         self.position = 0;
         self.token_history.clear();
         self.last_sample = None;
+        self.sampler_state = SamplerState::new(self.config.sampler.seed);
     }
 
     pub fn prefill(&mut self, prompt: &str) -> Result<Vec<u32>> {
@@ -270,12 +281,28 @@ impl Session {
             ));
         }
 
-        let sample = decoder_model_token_sample_with_kv_cache_f32(
-            self.model.as_ref(),
-            token_id,
-            &mut self.kv_cache,
-            self.position,
-        )?;
+        let sample = if self.config.sampler.is_greedy() {
+            decoder_model_token_sample_with_kv_cache_buffered_f32(
+                self.model.as_ref(),
+                token_id,
+                &mut self.kv_cache,
+                self.position,
+                &mut self.decode_workspace,
+            )?
+        } else {
+            decoder_model_token_logits_with_kv_cache_buffered_f32(
+                self.model.as_ref(),
+                token_id,
+                &mut self.kv_cache,
+                self.position,
+                &mut self.decode_workspace,
+            )?;
+            sample_last_token(
+                self.decode_workspace.logits(),
+                &self.config.sampler,
+                &mut self.sampler_state,
+            )?
+        };
         self.kv_cache.advance(1)?;
         self.position = self
             .position
@@ -298,11 +325,20 @@ impl Session {
             ));
         }
 
-        let sample = decoder_model_prefill_last_token_sample_with_kv_cache_f32(
-            self.model.as_ref(),
-            token_ids,
-            &mut self.kv_cache,
-        )?;
+        let sample = if self.config.sampler.is_greedy() {
+            decoder_model_prefill_last_token_sample_with_kv_cache_f32(
+                self.model.as_ref(),
+                token_ids,
+                &mut self.kv_cache,
+            )?
+        } else {
+            let logits = decoder_model_prefill_last_token_logits_with_kv_cache_f32(
+                self.model.as_ref(),
+                token_ids,
+                &mut self.kv_cache,
+            )?;
+            sample_last_token(&logits, &self.config.sampler, &mut self.sampler_state)?
+        };
         self.kv_cache.advance(token_ids.len())?;
         self.position = next_position;
         self.token_history.extend_from_slice(token_ids);

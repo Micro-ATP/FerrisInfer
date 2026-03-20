@@ -148,6 +148,20 @@ impl Tensor {
         Ok(self)
     }
 
+    pub fn reshape_in_place(&mut self, shape: Shape) -> Result<()> {
+        self.ensure_contiguous()?;
+
+        if self.element_count() != shape.element_count() {
+            return Err(FerrisError::new(
+                ErrorKind::InvalidShape,
+                "reshape must preserve element count",
+            ));
+        }
+
+        self.layout = Layout::contiguous(shape);
+        Ok(())
+    }
+
     pub fn byte_len(&self) -> usize {
         self.as_bytes().len()
     }
