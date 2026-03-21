@@ -10,7 +10,7 @@ use ferrisinfer_kernel::cpu::matmul::{
 use ferrisinfer_kernel::cpu::reduction::rms_norm_f32;
 use ferrisinfer_model::{ActivationKind, AttentionLayout, DecoderOnlyModel, ModelConfig, NormKind};
 
-use crate::kv_cache::KvCache;
+use crate::kv_cache::{KvCache, KvCacheStorageKind};
 use crate::sampler::TokenSample;
 
 pub struct ReferenceDecoderBlockWeights<'a> {
@@ -298,25 +298,15 @@ fn decoder_block_forward_buffered_f32(
 
     match kv_capture {
         Some((kv_cache, layer_index, start_position)) => {
-            if start_position == 0 {
-                causal_self_attention_f32(
-                    &workspace.query,
-                    &workspace.key,
-                    &workspace.value,
-                    &mut workspace.attention,
-                )?;
-            } else {
-                let cache_layer = kv_cache.layer(layer_index)?;
-                cached_prefixed_causal_attention_f32(
-                    &workspace.query,
-                    cache_layer.key(),
-                    cache_layer.value(),
-                    start_position,
-                    &workspace.key,
-                    &workspace.value,
-                    &mut workspace.attention,
-                )?;
-            }
+            prefill_causal_attention_with_kv_cache_f32(
+                &workspace.query,
+                &workspace.key,
+                &workspace.value,
+                &mut workspace.attention,
+                kv_cache,
+                layer_index,
+                start_position,
+            )?;
 
             kv_cache.write_sequence_uncommitted_f32(
                 layer_index,
@@ -431,6 +421,99 @@ fn decoder_model_prefill_hidden_with_kv_capture_f32(
     )?;
     Ok(next_hidden)
 }
+
+fn prefill_causal_attention_with_kv_cache_f32(
+    query: &Tensor,
+    key: &Tensor,
+    value: &Tensor,
+    attention: &mut Tensor,
+    kv_cache: &KvCache,
+    layer_index: usize,
+    start_position: usize,
+) -> Result<()> {
+    if start_position == 0 {
+        return causal_self_attention_f32(query, key, value, attention);
+    }
+
+    match kv_cache.storage_kind() {
+        KvCacheStorageKind::Contiguous => {
+            let cache_layer = kv_cache.layer(layer_index)?;
+            cached_prefixed_causal_attention_f32(
+                query,
+                cache_layer.key(),
+                cache_layer.value(),
+                start_position,
+                key,
+                value,
+                attention,
+            )
+        }
+        KvCacheStorageKind::Paged => {
+            let (cached_key, cached_value) =
+                kv_cache.read_prefix_f32(layer_index, start_position)?;
+            cached_prefixed_causal_attention_f32(
+                query,
+                &cached_key,
+                &cached_value,
+                start_position,
+                key,
+                value,
+                attention,
+            )
+        }
+    }
+}
+
+fn decode_causal_attention_with_kv_cache_f32(
+    query: &Tensor,
+    key: &mut Tensor,
+    value: &mut Tensor,
+    attention: &mut Tensor,
+    kv_cache: &mut KvCache,
+    layer_index: usize,
+    position: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+) -> Result<()> {
+    if position == 0 {
+        causal_self_attention_f32(query, key, value, attention)?;
+    } else {
+        match kv_cache.storage_kind() {
+            KvCacheStorageKind::Contiguous => {
+                key.reshape_in_place(Shape::from_slice(&[num_kv_heads, head_dim])?)?;
+                value.reshape_in_place(Shape::from_slice(&[num_kv_heads, head_dim])?)?;
+
+                let cache_layer = kv_cache.layer(layer_index)?;
+                decode_causal_attention_f32(
+                    query,
+                    cache_layer.key(),
+                    cache_layer.value(),
+                    position,
+                    key,
+                    value,
+                    attention,
+                )?;
+            }
+            KvCacheStorageKind::Paged => {
+                let (cached_key, cached_value) = kv_cache.read_prefix_f32(layer_index, position)?;
+                cached_prefixed_causal_attention_f32(
+                    query,
+                    &cached_key,
+                    &cached_value,
+                    position,
+                    key,
+                    value,
+                    attention,
+                )?;
+            }
+        }
+    }
+
+    key.reshape_in_place(Shape::from_slice(&[num_kv_heads, head_dim])?)?;
+    value.reshape_in_place(Shape::from_slice(&[num_kv_heads, head_dim])?)?;
+    kv_cache.write_uncommitted_f32(layer_index, position, key, value)
+}
+
 pub fn decoder_model_forward_f32(model: &DecoderOnlyModel, token_ids: &[u32]) -> Result<Tensor> {
     let normalized = decoder_model_hidden_f32(model, token_ids)?;
     let output_weight = output_weight(model)?;
@@ -707,29 +790,22 @@ fn decoder_block_decode_step_buffered_f32(
         config.rope_theta,
     )?;
 
-    workspace
-        .key
-        .reshape_in_place(Shape::from_slice(&[config.num_kv_heads, config.head_dim])?)?;
-    workspace
-        .value
-        .reshape_in_place(Shape::from_slice(&[config.num_kv_heads, config.head_dim])?)?;
-
-    let cache_layer = kv_cache.layer(layer_index)?;
     workspace.attention.reshape_in_place(Shape::from_slice(&[
         1,
         config.num_heads,
         config.head_dim,
     ])?)?;
-    decode_causal_attention_f32(
+    decode_causal_attention_with_kv_cache_f32(
         &workspace.query,
-        cache_layer.key(),
-        cache_layer.value(),
-        position,
-        &workspace.key,
-        &workspace.value,
+        &mut workspace.key,
+        &mut workspace.value,
         &mut workspace.attention,
+        kv_cache,
+        layer_index,
+        position,
+        config.num_kv_heads,
+        config.head_dim,
     )?;
-    kv_cache.write_uncommitted_f32(layer_index, position, &workspace.key, &workspace.value)?;
 
     workspace
         .query
@@ -833,7 +909,7 @@ fn decoder_block_decode_step_f32(
 
     let mut query_heads = reshape_heads_2d_to_3d(query, 1, config.num_heads, config.head_dim)?;
     let mut key_heads = reshape_heads_2d_to_3d(key, 1, config.num_kv_heads, config.head_dim)?;
-    let value_heads = reshape_heads_2d_to_3d(value, 1, config.num_kv_heads, config.head_dim)?;
+    let mut value_heads = reshape_heads_2d_to_3d(value, 1, config.num_kv_heads, config.head_dim)?;
 
     rope_f32(
         &mut query_heads,
@@ -843,22 +919,18 @@ fn decoder_block_decode_step_f32(
         config.rope_theta,
     )?;
 
-    let key_slot = attention_slot_tensor_f32(key_heads, config.num_kv_heads, config.head_dim)?;
-    let value_slot = attention_slot_tensor_f32(value_heads, config.num_kv_heads, config.head_dim)?;
-    let cache_layer = kv_cache.layer(layer_index)?;
-
     let mut attention_heads = zeros_3d(1, config.num_heads, config.head_dim)?;
-    decode_causal_attention_f32(
+    decode_causal_attention_with_kv_cache_f32(
         &query_heads,
-        cache_layer.key(),
-        cache_layer.value(),
-        position,
-        &key_slot,
-        &value_slot,
+        &mut key_heads,
+        &mut value_heads,
         &mut attention_heads,
+        kv_cache,
+        layer_index,
+        position,
+        config.num_kv_heads,
+        config.head_dim,
     )?;
-
-    kv_cache.write_uncommitted_f32(layer_index, position, &key_slot, &value_slot)?;
 
     let attention_merged = reshape_heads_3d_to_2d(attention_heads, 1, hidden_size)?;
 
@@ -1013,25 +1085,6 @@ fn get_weight<'a>(model: &'a DecoderOnlyModel, name: &str) -> Result<&'a Tensor>
 
 fn get_optional_weight<'a>(model: &'a DecoderOnlyModel, name: &str) -> Option<&'a Tensor> {
     model.weights().get(name)
-}
-
-#[allow(dead_code)]
-fn attention_slot_tensor_f32(
-    tensor: Tensor,
-    num_kv_heads: usize,
-    head_dim: usize,
-) -> Result<Tensor> {
-    tensor.ensure_dtype(DType::F32)?;
-    tensor.ensure_contiguous()?;
-
-    if tensor.shape().dims() != [1, num_kv_heads, head_dim] {
-        return Err(FerrisError::new(
-            ErrorKind::InvalidShape,
-            "attention slot tensor must have shape [1, num_kv_heads, head_dim]",
-        ));
-    }
-
-    tensor.reshape(Shape::from_slice(&[num_kv_heads, head_dim])?)
 }
 
 fn reshape_heads_2d_to_3d(
@@ -1412,6 +1465,46 @@ mod tests {
     }
 
     #[test]
+    fn decoder_model_token_logits_with_paged_kv_cache_matches_full_forward_last_row() {
+        let model = tiny_reference_model();
+        let mut kv_cache = KvCache::new_paged(
+            KvCacheConfig {
+                num_layers: 1,
+                num_kv_heads: 1,
+                head_dim: 2,
+                max_sequence_length: 8,
+                dtype: DType::F32,
+            },
+            2,
+        )
+        .unwrap();
+        let mut last_logits = None;
+
+        for (position, token_id) in [0u32, 1u32].iter().copied().enumerate() {
+            let logits = decoder_model_token_logits_with_kv_cache_f32(
+                &model,
+                token_id,
+                &mut kv_cache,
+                position,
+            )
+            .unwrap();
+            kv_cache.advance(1).unwrap();
+            last_logits = Some(logits);
+        }
+
+        let last_logits = last_logits.unwrap();
+        let full_last_logits = decoder_model_last_token_logits_f32(&model, &[0, 1]).unwrap();
+
+        approx_eq_slice(
+            &last_logits.to_vec_f32().unwrap(),
+            &full_last_logits.to_vec_f32().unwrap(),
+            1e-5,
+        );
+        assert_eq!(kv_cache.used_tokens(), 2);
+        assert_eq!(kv_cache.storage_kind(), KvCacheStorageKind::Paged);
+    }
+
+    #[test]
     fn decoder_model_token_sample_with_kv_cache_matches_logits_argmax() {
         let model = tiny_reference_model();
         let mut kv_cache = KvCache::new(KvCacheConfig {
@@ -1511,6 +1604,74 @@ mod tests {
             1e-5,
         );
         assert_eq!(kv_cache.used_tokens(), 3);
+    }
+
+    #[test]
+    fn decoder_model_prefill_last_token_logits_with_existing_paged_kv_matches_full_forward_last_row(
+    ) {
+        let model = tiny_reference_model();
+        let mut kv_cache = KvCache::new_paged(
+            KvCacheConfig {
+                num_layers: 1,
+                num_kv_heads: 1,
+                head_dim: 2,
+                max_sequence_length: 8,
+                dtype: DType::F32,
+            },
+            2,
+        )
+        .unwrap();
+
+        let _ = decoder_model_token_logits_with_kv_cache_f32(&model, 0, &mut kv_cache, 0).unwrap();
+        kv_cache.advance(1).unwrap();
+
+        let logits = decoder_model_prefill_last_token_logits_with_kv_cache_f32(
+            &model,
+            &[1, 0],
+            &mut kv_cache,
+        )
+        .unwrap();
+        kv_cache.advance(2).unwrap();
+        let full_last_logits = decoder_model_last_token_logits_f32(&model, &[0, 1, 0]).unwrap();
+
+        approx_eq_slice(
+            &logits.to_vec_f32().unwrap(),
+            &full_last_logits.to_vec_f32().unwrap(),
+            1e-5,
+        );
+        assert_eq!(kv_cache.used_tokens(), 3);
+        assert_eq!(kv_cache.storage_kind(), KvCacheStorageKind::Paged);
+    }
+
+    #[test]
+    fn decoder_model_token_logits_with_imported_paged_prefix_matches_full_forward_last_row() {
+        let model = tiny_reference_model();
+        let config = KvCacheConfig {
+            num_layers: 1,
+            num_kv_heads: 1,
+            head_dim: 2,
+            max_sequence_length: 8,
+            dtype: DType::F32,
+        };
+        let mut source = KvCache::new_paged(config.clone(), 2).unwrap();
+        let mut dest = KvCache::new_paged(config, 2).unwrap();
+
+        let _ =
+            decoder_model_prefill_last_token_logits_with_kv_cache_f32(&model, &[0, 1], &mut source)
+                .unwrap();
+        source.advance(2).unwrap();
+        dest.copy_prefix_from(&source, 2).unwrap();
+
+        let logits = decoder_model_token_logits_with_kv_cache_f32(&model, 0, &mut dest, 2).unwrap();
+        let full_last_logits = decoder_model_last_token_logits_f32(&model, &[0, 1, 0]).unwrap();
+
+        approx_eq_slice(
+            &logits.to_vec_f32().unwrap(),
+            &full_last_logits.to_vec_f32().unwrap(),
+            1e-5,
+        );
+        assert_eq!(dest.used_tokens(), 2);
+        assert_eq!(dest.storage_kind(), KvCacheStorageKind::Paged);
     }
 
     #[test]

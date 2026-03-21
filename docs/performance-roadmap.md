@@ -432,7 +432,8 @@ FerrisInfer 的项目原则决定了 NVIDIA 路线不能简单照搬外部框架
 13. 已完成：把 CUDA 基础设施从 driver probe 推进到可实际 retain context、分配 device buffer、执行 host-device 往返拷贝的最小 runtime base
 14. 已完成：让 reference scheduler 在 sequence 结束后释放 session / KV cache 资源，并让 PrefixBlockManager 的 refcount 生命周期与 sequence finish 对齐
 15. 已完成：为 paged KV 引入 logical block -> physical page 映射、free-list allocator 与 reset/import 后的 page reuse，block table 不再绑定固定 page index
-16. 下一步：把 block manager / prefix index 从“sequence 生命周期释放 + page allocator”继续推进到真实 cross-sequence page refcount / page sharing，并逐步把 reference attention 从 contiguous layer_view 过渡到更贴近 paged storage 的执行接口；同时继续把 CUDA 从原始 buffer 推进到 tensor storage 与第一批基础 kernel（zero/fill/copy -> matmul / attention），保持 CPU 跨平台基线不回退
+16. 已完成：让 reference attention 在 paged storage 下改走 `read_prefix_f32`，prefill / decode 不再依赖 contiguous `layer_view` 语义即可完成已提交前缀读取
+17. 下一步：把 block manager / prefix index 从“sequence 生命周期释放 + page allocator”继续推进到真实 cross-sequence page refcount / page sharing，并把当前 paged reference attention 从“按前缀 gather 成连续 tensor 再计算”推进到真正 page-table / block-table 驱动的 attention 接口；同时继续把 CUDA 从 tensor storage 推进到第一批基础 kernel（zero/fill/copy -> matmul / attention），保持 CPU 跨平台基线不回退
 
 这是当前最稳、也最接近长期目标的路线。
 

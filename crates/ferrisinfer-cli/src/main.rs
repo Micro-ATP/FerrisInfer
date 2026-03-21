@@ -206,6 +206,9 @@ fn print_plan(engine: &InferenceEngine<CpuBackend>, config: &SessionConfig) {
     println!("runtime scheduler: sequence state + reference scheduler available");
     println!("runtime batching: continuous batching reference benchmark available");
     println!("kv cache storage: contiguous default, paged prototype + logical-physical page allocator available");
+    println!(
+        "reference attention: paged prefill/decode reads committed KV prefixes without relying on contiguous layer views"
+    );
     println!("kv prefix reuse: paged block table + prefix handle + prefix index available");
     println!("runtime lifecycle: finished sequence session/KV release + prefix refcount release available");
     println!("prefill scheduling: chunked prefill reference path available");
