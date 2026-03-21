@@ -81,39 +81,58 @@ impl PrefixBlockManager {
         self.shared_prefixes.get(&sequence_id)
     }
 
-    pub fn update_owned_prefix(&mut self, sequence_id: SequenceId, handle: Option<PrefixHandle>) {
+    pub fn update_owned_prefix(
+        &mut self,
+        sequence_id: SequenceId,
+        handle: Option<PrefixHandle>,
+    ) -> Vec<ManagedBlockId> {
+        let mut released_blocks = Vec::new();
         if let Some(previous) = self.owned_prefixes.remove(&sequence_id) {
-            self.apply_handle_refs(sequence_id, &previous, false);
+            released_blocks.extend(self.apply_handle_refs(sequence_id, &previous, false));
         }
 
         if let Some(handle) = handle {
             self.apply_handle_refs(sequence_id, &handle, true);
             self.owned_prefixes.insert(sequence_id, handle);
         }
+
+        released_blocks
     }
 
     pub fn update_shared_prefix(
         &mut self,
         sequence_id: SequenceId,
         assignment: Option<SharedPrefixAssignment>,
-    ) {
+    ) -> Vec<ManagedBlockId> {
+        let mut released_blocks = Vec::new();
         if let Some(previous) = self.shared_prefixes.remove(&sequence_id) {
-            self.apply_handle_refs(previous.source_sequence_id(), previous.handle(), false);
+            released_blocks.extend(self.apply_handle_refs(
+                previous.source_sequence_id(),
+                previous.handle(),
+                false,
+            ));
         }
 
         if let Some(assignment) = assignment {
             self.apply_handle_refs(assignment.source_sequence_id(), assignment.handle(), true);
             self.shared_prefixes.insert(sequence_id, assignment);
         }
+
+        released_blocks
     }
 
-    pub fn remove_sequence(&mut self, sequence_id: SequenceId) {
-        self.update_shared_prefix(sequence_id, None);
-        self.update_owned_prefix(sequence_id, None);
+    pub fn remove_sequence(&mut self, sequence_id: SequenceId) -> Vec<ManagedBlockId> {
+        let mut released_blocks = self.update_shared_prefix(sequence_id, None);
+        released_blocks.extend(self.update_owned_prefix(sequence_id, None));
+        released_blocks
     }
 
     pub fn block_ref_count(&self, block_id: ManagedBlockId) -> usize {
         self.ref_counts.get(&block_id).copied().unwrap_or(0)
+    }
+
+    pub fn tracked_block_count(&self) -> usize {
+        self.ref_counts.len()
     }
 
     fn apply_handle_refs(
@@ -121,7 +140,8 @@ impl PrefixBlockManager {
         owner_sequence_id: SequenceId,
         handle: &PrefixHandle,
         increment: bool,
-    ) {
+    ) -> Vec<ManagedBlockId> {
+        let mut released_blocks = Vec::new();
         for layer_index in 0..handle.layer_count() {
             let Some(entries) = handle.layer_block_table(layer_index) else {
                 continue;
@@ -141,10 +161,13 @@ impl PrefixBlockManager {
                     };
                     if should_remove {
                         self.ref_counts.remove(&block_id);
+                        released_blocks.push(block_id);
                     }
                 }
             }
         }
+
+        released_blocks
     }
 }
 
@@ -232,7 +255,8 @@ mod tests {
             2
         );
 
-        manager.remove_sequence(target_sequence_id);
+        let released_blocks = manager.remove_sequence(target_sequence_id);
+        assert!(released_blocks.is_empty());
         assert_eq!(
             manager.block_ref_count(ManagedBlockId::new(
                 source_sequence_id,
@@ -248,6 +272,34 @@ mod tests {
                 KvBlockId::new(1)
             )),
             1
+        );
+    }
+
+    #[test]
+    fn prefix_block_manager_reports_released_blocks_when_owner_is_removed() {
+        let mut manager = PrefixBlockManager::new();
+        let sequence_id = SequenceId::new(7);
+        let handle = PrefixHandle::new_for_tests(
+            4,
+            2,
+            vec![vec![
+                KvBlockTableEntry::new_for_tests(0, 0, 0, 2),
+                KvBlockTableEntry::new_for_tests(1, 1, 2, 2),
+            ]],
+        );
+
+        manager.update_owned_prefix(sequence_id, Some(handle));
+        let released_blocks = manager.remove_sequence(sequence_id);
+
+        assert_eq!(manager.tracked_block_count(), 0);
+        assert_eq!(released_blocks.len(), 2);
+        assert_eq!(
+            released_blocks[0],
+            ManagedBlockId::new(sequence_id, 0, KvBlockId::new(0))
+        );
+        assert_eq!(
+            released_blocks[1],
+            ManagedBlockId::new(sequence_id, 0, KvBlockId::new(1))
         );
     }
 }

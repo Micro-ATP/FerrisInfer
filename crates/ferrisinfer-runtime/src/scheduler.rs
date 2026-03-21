@@ -4,7 +4,7 @@ use ferrisinfer_core::{ErrorKind, FerrisError, Result};
 use ferrisinfer_io::Tokenizer;
 use ferrisinfer_model::DecoderOnlyModel;
 
-use crate::block_manager::{PrefixBlockManager, SharedPrefixAssignment};
+use crate::block_manager::{ManagedBlockId, PrefixBlockManager, SharedPrefixAssignment};
 use crate::prefix_index::{PrefixIndex, PrefixIndexConfig, PrefixIndexEntry};
 use crate::sampler::TokenSample;
 use crate::sequence::{
@@ -61,6 +61,7 @@ pub struct SequenceExecutionUpdate {
     pub generated_token: Option<TokenSample>,
     pub phase: SequencePhase,
     pub finish_reason: Option<SequenceFinishReason>,
+    pub released_prefix_blocks: Vec<ManagedBlockId>,
 }
 
 #[derive(Debug, Clone)]
@@ -71,7 +72,38 @@ pub struct SchedulerExecutionReport {
 
 struct SequenceEntry {
     state: SequenceState,
-    session: Session,
+    session: Option<Session>,
+}
+
+impl SequenceEntry {
+    fn session(&self) -> Result<&Session> {
+        self.session.as_ref().ok_or_else(|| {
+            FerrisError::new(
+                ErrorKind::Runtime,
+                format!(
+                    "scheduler sequence {} no longer retains an active session",
+                    self.state.sequence_id().raw()
+                ),
+            )
+        })
+    }
+
+    fn session_mut(&mut self) -> Result<&mut Session> {
+        let sequence_id = self.state.sequence_id();
+        self.session.as_mut().ok_or_else(|| {
+            FerrisError::new(
+                ErrorKind::Runtime,
+                format!(
+                    "scheduler sequence {} no longer retains an active session",
+                    sequence_id.raw()
+                ),
+            )
+        })
+    }
+
+    fn release_session(&mut self) {
+        self.session = None;
+    }
 }
 
 pub struct ReferenceScheduler {
@@ -149,6 +181,13 @@ impl ReferenceScheduler {
         self.sequences.len()
     }
 
+    pub fn resident_session_count(&self) -> usize {
+        self.sequences
+            .iter()
+            .filter(|entry| entry.session.is_some())
+            .count()
+    }
+
     pub fn has_pending(&self) -> bool {
         self.sequences
             .iter()
@@ -200,7 +239,10 @@ impl ReferenceScheduler {
             self.session_config.clone(),
         )?;
 
-        self.sequences.push(SequenceEntry { state, session });
+        self.sequences.push(SequenceEntry {
+            state,
+            session: Some(session),
+        });
         self.prefix_block_manager
             .update_shared_prefix(sequence_id, None);
         self.refresh_sequence_prefix_metadata(sequence_id)?;
@@ -328,16 +370,16 @@ impl ReferenceScheduler {
             let target = &mut left[target_index];
             let source = &right[0];
             target
-                .session
-                .copy_prefix_from_session(&source.session, shared_prefix_tokens)?;
+                .session_mut()?
+                .copy_prefix_from_session(source.session()?, shared_prefix_tokens)?;
             target.state.record_prefill(shared_prefix_tokens);
         } else {
             let (left, right) = self.sequences.split_at_mut(target_index);
             let source = &left[source_index];
             let target = &mut right[0];
             target
-                .session
-                .copy_prefix_from_session(&source.session, shared_prefix_tokens)?;
+                .session_mut()?
+                .copy_prefix_from_session(source.session()?, shared_prefix_tokens)?;
             target.state.record_prefill(shared_prefix_tokens);
         }
 
@@ -375,94 +417,123 @@ impl ReferenceScheduler {
     fn execute_prefill(&mut self, sequence_id: SequenceId) -> Result<SequenceExecutionUpdate> {
         let max_prefill_chunk_tokens = self.config.max_prefill_chunk_tokens;
         let reused_prompt_tokens = self.maybe_share_prefix(sequence_id)?;
-        let entry = self.find_entry_mut(sequence_id)?;
-        let appended_prompt_tokens = entry.state.next_prefill_chunk_len(max_prefill_chunk_tokens);
-        if appended_prompt_tokens > 0 {
-            let prompt_chunk = entry
-                .state
-                .next_prefill_chunk(max_prefill_chunk_tokens)
-                .to_vec();
-            entry.session.prefill_tokens(&prompt_chunk)?;
-            entry.state.record_prefill(appended_prompt_tokens);
-        }
+        let (request_id, appended_prompt_tokens, phase, finish_reason) = {
+            let entry = self.find_entry_mut(sequence_id)?;
+            let appended_prompt_tokens =
+                entry.state.next_prefill_chunk_len(max_prefill_chunk_tokens);
+            if appended_prompt_tokens > 0 {
+                let prompt_chunk = entry
+                    .state
+                    .next_prefill_chunk(max_prefill_chunk_tokens)
+                    .to_vec();
+                entry.session_mut()?.prefill_tokens(&prompt_chunk)?;
+                entry.state.record_prefill(appended_prompt_tokens);
+            }
 
-        let finish_reason = if entry.state.generation_budget_reached() {
-            Some(entry.state.generation_budget_finish_reason())
-        } else if entry.session.position() >= entry.session.config().max_sequence_length {
-            Some(SequenceFinishReason::SequenceLength)
+            let finish_reason = if entry.state.generation_budget_reached() {
+                Some(entry.state.generation_budget_finish_reason())
+            } else if entry.session()?.position() >= entry.session()?.config().max_sequence_length {
+                Some(SequenceFinishReason::SequenceLength)
+            } else {
+                None
+            };
+
+            if let Some(reason) = finish_reason {
+                entry.state.finish(reason);
+            }
+
+            (
+                entry.state.request_id(),
+                appended_prompt_tokens,
+                entry.state.phase(),
+                finish_reason,
+            )
+        };
+        let released_prefix_blocks = if finish_reason.is_some() {
+            self.release_sequence_resources(sequence_id)?
         } else {
-            None
+            Vec::new()
         };
 
-        if let Some(reason) = finish_reason {
-            entry.state.finish(reason);
-        }
-
         Ok(SequenceExecutionUpdate {
-            request_id: entry.state.request_id(),
+            request_id,
             sequence_id,
             batch_kind: SchedulerBatchKind::Prefill,
             reused_prompt_tokens,
             appended_prompt_tokens,
             generated_token: None,
-            phase: entry.state.phase(),
+            phase,
             finish_reason,
+            released_prefix_blocks,
         })
     }
 
     fn execute_decode(&mut self, sequence_id: SequenceId) -> Result<SequenceExecutionUpdate> {
-        let entry = self.find_entry_mut(sequence_id)?;
+        let (request_id, generated_token, phase, finish_reason) = {
+            let entry = self.find_entry_mut(sequence_id)?;
 
-        let finish_reason =
-            if entry.session.position() >= entry.session.config().max_sequence_length {
-                Some(SequenceFinishReason::SequenceLength)
+            let finish_reason =
+                if entry.session()?.position() >= entry.session()?.config().max_sequence_length {
+                    Some(SequenceFinishReason::SequenceLength)
+                } else {
+                    None
+                };
+            if let Some(reason) = finish_reason {
+                entry.state.finish(reason);
+                (
+                    entry.state.request_id(),
+                    None,
+                    entry.state.phase(),
+                    Some(reason),
+                )
             } else {
-                None
-            };
-        if let Some(reason) = finish_reason {
-            entry.state.finish(reason);
-            return Ok(SequenceExecutionUpdate {
-                request_id: entry.state.request_id(),
-                sequence_id,
-                batch_kind: SchedulerBatchKind::Decode,
-                reused_prompt_tokens: 0,
-                appended_prompt_tokens: 0,
-                generated_token: None,
-                phase: entry.state.phase(),
-                finish_reason: Some(reason),
-            });
-        }
+                let generated = entry.session_mut()?.step_reference()?;
+                entry.state.record_generated_token(generated.token_id);
 
-        let generated = entry.session.step_reference()?;
-        entry.state.record_generated_token(generated.token_id);
+                let finish_reason = if entry
+                    .state
+                    .stop_token_id()
+                    .is_some_and(|stop| stop == generated.token_id)
+                {
+                    Some(SequenceFinishReason::StopToken)
+                } else if entry.state.generation_budget_reached() {
+                    Some(entry.state.generation_budget_finish_reason())
+                } else if entry.session()?.position()
+                    >= entry.session()?.config().max_sequence_length
+                {
+                    Some(SequenceFinishReason::SequenceLength)
+                } else {
+                    None
+                };
 
-        let finish_reason = if entry
-            .state
-            .stop_token_id()
-            .is_some_and(|stop| stop == generated.token_id)
-        {
-            Some(SequenceFinishReason::StopToken)
-        } else if entry.state.generation_budget_reached() {
-            Some(entry.state.generation_budget_finish_reason())
-        } else if entry.session.position() >= entry.session.config().max_sequence_length {
-            Some(SequenceFinishReason::SequenceLength)
+                if let Some(reason) = finish_reason {
+                    entry.state.finish(reason);
+                }
+
+                (
+                    entry.state.request_id(),
+                    Some(generated),
+                    entry.state.phase(),
+                    finish_reason,
+                )
+            }
+        };
+        let released_prefix_blocks = if finish_reason.is_some() {
+            self.release_sequence_resources(sequence_id)?
         } else {
-            None
+            Vec::new()
         };
 
-        if let Some(reason) = finish_reason {
-            entry.state.finish(reason);
-        }
-
         Ok(SequenceExecutionUpdate {
-            request_id: entry.state.request_id(),
+            request_id,
             sequence_id,
             batch_kind: SchedulerBatchKind::Decode,
             reused_prompt_tokens: 0,
             appended_prompt_tokens: 0,
-            generated_token: Some(generated),
-            phase: entry.state.phase(),
+            generated_token,
+            phase,
             finish_reason,
+            released_prefix_blocks,
         })
     }
 
@@ -479,7 +550,7 @@ impl ReferenceScheduler {
         })?;
 
         Ok(source
-            .session
+            .session()?
             .prefix_handle(token_count)?
             .map(|handle| SharedPrefixAssignment::new(source.state.sequence_id(), handle)))
     }
@@ -487,11 +558,15 @@ impl ReferenceScheduler {
     fn rebuild_prefix_index(&mut self) {
         self.prefix_index.clear();
         for entry in &self.sequences {
+            if entry.state.is_finished() {
+                continue;
+            }
+
             self.prefix_index.upsert(PrefixIndexEntry {
                 sequence_id: entry.state.sequence_id(),
                 prompt_tokens: entry.state.prompt_tokens().to_vec(),
                 cached_prompt_tokens: entry.state.cached_prompt_tokens(),
-                session_position: entry.session.position(),
+                session_position: entry.state.cached_tokens(),
             });
         }
     }
@@ -499,13 +574,28 @@ impl ReferenceScheduler {
     fn refresh_sequence_prefix_metadata(&mut self, sequence_id: SequenceId) -> Result<()> {
         let prefix_handle = {
             let entry = self.find_entry(sequence_id)?;
-            entry
-                .session
-                .prefix_handle(entry.state.cached_prompt_tokens())?
+            if entry.state.is_finished() {
+                None
+            } else {
+                entry
+                    .session()?
+                    .prefix_handle(entry.state.cached_prompt_tokens())?
+            }
         };
         self.prefix_block_manager
             .update_owned_prefix(sequence_id, prefix_handle);
         Ok(())
+    }
+
+    fn release_sequence_resources(
+        &mut self,
+        sequence_id: SequenceId,
+    ) -> Result<Vec<ManagedBlockId>> {
+        {
+            let entry = self.find_entry_mut(sequence_id)?;
+            entry.release_session();
+        }
+        Ok(self.prefix_block_manager.remove_sequence(sequence_id))
     }
 
     fn find_entry(&self, sequence_id: SequenceId) -> Result<&SequenceEntry> {
@@ -848,6 +938,104 @@ mod tests {
             .prefix_block_manager
             .shared_prefix(second)
             .is_some());
+    }
+
+    #[test]
+    fn reference_scheduler_releases_finished_paged_sequence_resources() {
+        let mut scheduler = test_scheduler(
+            SessionConfig {
+                kv_cache: crate::session::SessionKvCacheConfig::Paged { page_size: 2 },
+                ..SessionConfig::default()
+            },
+            SchedulerConfig::default(),
+        );
+        let sequence_id = scheduler
+            .submit(SequenceSubmitRequest {
+                prompt_token_ids: vec![0, 1],
+                max_new_tokens: 1,
+                stop_token_id: None,
+            })
+            .unwrap();
+
+        assert_eq!(scheduler.resident_session_count(), 1);
+        let prefill = scheduler.execute_next_tick().unwrap().unwrap();
+        assert!(prefill.updates[0].released_prefix_blocks.is_empty());
+
+        let decode = scheduler.execute_next_tick().unwrap().unwrap();
+        assert_eq!(
+            decode.updates[0].finish_reason,
+            Some(SequenceFinishReason::MaxNewTokens)
+        );
+        assert_eq!(scheduler.resident_session_count(), 0);
+        assert_eq!(
+            scheduler
+                .prefix_block_manager
+                .block_ref_count(ManagedBlockId::new(sequence_id, 0, KvBlockId::new(0))),
+            0
+        );
+        assert_eq!(decode.updates[0].released_prefix_blocks.len(), 1);
+        assert_eq!(
+            decode.updates[0].released_prefix_blocks[0],
+            ManagedBlockId::new(sequence_id, 0, KvBlockId::new(0))
+        );
+    }
+
+    #[test]
+    fn reference_scheduler_releases_shared_prefix_refs_when_target_finishes() {
+        let mut scheduler = test_scheduler(
+            SessionConfig {
+                kv_cache: crate::session::SessionKvCacheConfig::Paged { page_size: 2 },
+                ..SessionConfig::default()
+            },
+            SchedulerConfig {
+                max_batch_size: 2,
+                min_prefix_share_tokens: 2,
+                ..SchedulerConfig::default()
+            },
+        );
+        let first = scheduler
+            .submit(SequenceSubmitRequest {
+                prompt_token_ids: vec![0, 1, 0, 1],
+                max_new_tokens: 3,
+                stop_token_id: None,
+            })
+            .unwrap();
+        scheduler.execute_next_tick().unwrap().unwrap();
+
+        let second = scheduler
+            .submit(SequenceSubmitRequest {
+                prompt_token_ids: vec![0, 1, 0, 0],
+                max_new_tokens: 1,
+                stop_token_id: None,
+            })
+            .unwrap();
+        scheduler.execute_next_tick().unwrap().unwrap();
+
+        let decode = scheduler.execute_next_tick().unwrap().unwrap();
+        let second_update = decode
+            .updates
+            .iter()
+            .find(|update| update.sequence_id == second)
+            .unwrap();
+
+        assert_eq!(
+            second_update.finish_reason,
+            Some(SequenceFinishReason::MaxNewTokens)
+        );
+        assert_eq!(scheduler.resident_session_count(), 1);
+        assert_eq!(
+            scheduler
+                .prefix_block_manager
+                .block_ref_count(ManagedBlockId::new(first, 0, KvBlockId::new(0))),
+            1
+        );
+        assert_eq!(
+            scheduler
+                .prefix_block_manager
+                .block_ref_count(ManagedBlockId::new(first, 0, KvBlockId::new(1))),
+            1
+        );
+        assert!(!second_update.released_prefix_blocks.is_empty());
     }
 
     #[test]
