@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
+use ferrisinfer_core::{Shape, Tensor};
 use ferrisinfer_io::{ChatMessage, HfSource, ModelSource, Tokenizer, VocabularyTokenizer};
 use ferrisinfer_kernel::{Backend, CpuBackend, NvidiaCudaBackend, NvidiaCudaProbe};
 use ferrisinfer_model::DecoderOnlyModel;
@@ -29,6 +30,8 @@ fn main() {
             Ok(())
         }
         Some("probe-cuda") => probe_cuda(),
+        Some("smoke-cuda") => smoke_cuda(args.get(2).map(String::as_str)),
+        Some("smoke-cuda-tensor") => smoke_cuda_tensor(args.get(2).map(String::as_str)),
         Some("inspect-hf") => inspect_hf(args.get(2).map(String::as_str)),
         Some("profile-hf-load") => profile_hf_load(args.get(2).map(String::as_str)),
         Some("profile-hf") => profile_hf(
@@ -123,6 +126,8 @@ fn print_help() {
     println!("  help                           Show this message");
     println!("  plan                           Print the current implementation framework");
     println!("  probe-cuda                     Probe the NVIDIA CUDA driver and enumerate devices");
+    println!("  smoke-cuda [bytes]             Allocate CUDA memory and verify host-device copies");
+    println!("  smoke-cuda-tensor [elements]   Verify CUDA tensor upload/download/zero with f32 payloads");
     println!("  inspect-hf [path]              Inspect a local Hugging Face model directory");
     println!(
         "  profile-hf-load [path]         Measure config/tokenizer/weights/model load timings"
@@ -189,6 +194,12 @@ fn print_plan(engine: &InferenceEngine<CpuBackend>, config: &SessionConfig) {
     );
     print_nvidia_cuda_probe_summary(nvidia_cuda_probe);
     println!(
+        "nvidia cuda runtime base: context + device buffer + host-device copy prototype available"
+    );
+    println!(
+        "nvidia cuda tensor storage: dtype + shape + host-device tensor upload/download prototype available"
+    );
+    println!(
         "default max sequence length: {}",
         config.max_sequence_length
     );
@@ -209,6 +220,189 @@ fn probe_cuda() -> Result<(), ()> {
     let backend = NvidiaCudaBackend::default();
     println!("FerrisInfer NVIDIA CUDA probe");
     print_nvidia_cuda_probe(backend.probe());
+    Ok(())
+}
+
+fn smoke_cuda(size_bytes: Option<&str>) -> Result<(), ()> {
+    let size_bytes = parse_cuda_smoke_bytes(size_bytes)?;
+    let backend = NvidiaCudaBackend::default();
+
+    println!("FerrisInfer NVIDIA CUDA memory smoke");
+    print_nvidia_cuda_probe(backend.probe());
+
+    let context = backend.create_context(0).map_err(|error| {
+        eprintln!("failed to create NVIDIA CUDA context: {}", error);
+    })?;
+    let payload = build_cuda_smoke_payload(size_bytes);
+
+    let upload_start = Instant::now();
+    let mut buffer = context.upload_bytes(&payload).map_err(|error| {
+        eprintln!("failed to allocate/upload CUDA device buffer: {}", error);
+    })?;
+    context.synchronize().map_err(|error| {
+        eprintln!("failed to synchronize CUDA context after upload: {}", error);
+    })?;
+    let upload_elapsed = upload_start.elapsed();
+
+    let download_start = Instant::now();
+    let downloaded = buffer.download_to_vec().map_err(|error| {
+        eprintln!("failed to download CUDA device buffer: {}", error);
+    })?;
+    context.synchronize().map_err(|error| {
+        eprintln!(
+            "failed to synchronize CUDA context after download: {}",
+            error
+        );
+    })?;
+    let download_elapsed = download_start.elapsed();
+    let roundtrip_exact = downloaded == payload;
+
+    let zero_start = Instant::now();
+    buffer.fill_zero().map_err(|error| {
+        eprintln!("failed to zero CUDA device buffer: {}", error);
+    })?;
+    context.synchronize().map_err(|error| {
+        eprintln!(
+            "failed to synchronize CUDA context after zero fill: {}",
+            error
+        );
+    })?;
+    let zeroed = buffer.download_to_vec().map_err(|error| {
+        eprintln!("failed to download zeroed CUDA device buffer: {}", error);
+    })?;
+    let zero_elapsed = zero_start.elapsed();
+    let zero_fill_exact = zeroed.iter().all(|&byte| byte == 0);
+
+    println!(
+        "selected cuda device: cuda:{} {} cc={}.{} vram_mib={}",
+        context.device().ordinal(),
+        context.device().name(),
+        context.device().compute_capability_major(),
+        context.device().compute_capability_minor(),
+        bytes_to_mib(context.device().total_memory_bytes())
+    );
+    println!("buffer bytes: {}", size_bytes);
+    println!("upload+alloc elapsed: {:.3?}", upload_elapsed);
+    println!("download elapsed: {:.3?}", download_elapsed);
+    println!("zero+verify elapsed: {:.3?}", zero_elapsed);
+    println!(
+        "roundtrip exact: {}",
+        if roundtrip_exact { "yes" } else { "no" }
+    );
+    println!(
+        "zero fill exact: {}",
+        if zero_fill_exact { "yes" } else { "no" }
+    );
+
+    if !roundtrip_exact || !zero_fill_exact {
+        eprintln!("CUDA memory smoke verification failed");
+        return Err(());
+    }
+
+    Ok(())
+}
+
+fn smoke_cuda_tensor(element_count: Option<&str>) -> Result<(), ()> {
+    let element_count = parse_cuda_smoke_elements(element_count)?;
+    let backend = NvidiaCudaBackend::default();
+
+    println!("FerrisInfer NVIDIA CUDA tensor smoke");
+    print_nvidia_cuda_probe(backend.probe());
+
+    let context = backend.create_context(0).map_err(|error| {
+        eprintln!("failed to create NVIDIA CUDA context: {}", error);
+    })?;
+    let payload = build_cuda_smoke_tensor_payload(element_count);
+    let shape = Shape::from_slice(&[element_count]).map_err(|error| {
+        eprintln!("failed to build CUDA smoke tensor shape: {}", error);
+    })?;
+    let host_tensor = Tensor::from_f32_vec(shape, payload.clone()).map_err(|error| {
+        eprintln!("failed to build CUDA smoke host tensor: {}", error);
+    })?;
+
+    let upload_start = Instant::now();
+    let mut device_tensor = context.upload_tensor(&host_tensor).map_err(|error| {
+        eprintln!("failed to upload CUDA tensor: {}", error);
+    })?;
+    context.synchronize().map_err(|error| {
+        eprintln!(
+            "failed to synchronize CUDA context after tensor upload: {}",
+            error
+        );
+    })?;
+    let upload_elapsed = upload_start.elapsed();
+
+    let download_start = Instant::now();
+    let downloaded = device_tensor.download_to_tensor().map_err(|error| {
+        eprintln!("failed to download CUDA tensor: {}", error);
+    })?;
+    context.synchronize().map_err(|error| {
+        eprintln!(
+            "failed to synchronize CUDA context after tensor download: {}",
+            error
+        );
+    })?;
+    let download_elapsed = download_start.elapsed();
+    let roundtrip_exact = downloaded.to_vec_f32().map_err(|error| {
+        eprintln!("failed to decode downloaded CUDA tensor payload: {}", error);
+    })? == payload;
+
+    let zero_start = Instant::now();
+    device_tensor.fill_zero().map_err(|error| {
+        eprintln!("failed to zero CUDA tensor: {}", error);
+    })?;
+    context.synchronize().map_err(|error| {
+        eprintln!(
+            "failed to synchronize CUDA context after tensor zero fill: {}",
+            error
+        );
+    })?;
+    let zeroed = device_tensor.download_to_tensor().map_err(|error| {
+        eprintln!("failed to download zeroed CUDA tensor: {}", error);
+    })?;
+    context.synchronize().map_err(|error| {
+        eprintln!(
+            "failed to synchronize CUDA context after zeroed tensor download: {}",
+            error
+        );
+    })?;
+    let zero_elapsed = zero_start.elapsed();
+    let zero_fill_exact = zeroed
+        .to_vec_f32()
+        .map_err(|error| {
+            eprintln!("failed to decode zeroed CUDA tensor payload: {}", error);
+        })?
+        .iter()
+        .all(|&value| value == 0.0);
+
+    println!(
+        "selected cuda device: cuda:{} {} cc={}.{} vram_mib={}",
+        context.device().ordinal(),
+        context.device().name(),
+        context.device().compute_capability_major(),
+        context.device().compute_capability_minor(),
+        bytes_to_mib(context.device().total_memory_bytes())
+    );
+    println!("tensor dtype: {}", host_tensor.dtype().name());
+    println!("tensor elements: {}", element_count);
+    println!("tensor bytes: {}", device_tensor.len_bytes());
+    println!("upload+alloc elapsed: {:.3?}", upload_elapsed);
+    println!("download elapsed: {:.3?}", download_elapsed);
+    println!("zero+verify elapsed: {:.3?}", zero_elapsed);
+    println!(
+        "roundtrip exact: {}",
+        if roundtrip_exact { "yes" } else { "no" }
+    );
+    println!(
+        "zero fill exact: {}",
+        if zero_fill_exact { "yes" } else { "no" }
+    );
+
+    if !roundtrip_exact || !zero_fill_exact {
+        eprintln!("CUDA tensor smoke verification failed");
+        return Err(());
+    }
+
     Ok(())
 }
 
@@ -253,6 +447,53 @@ fn print_nvidia_cuda_probe(probe: &NvidiaCudaProbe) {
 
 fn bytes_to_mib(bytes: u64) -> u64 {
     bytes / (1024 * 1024)
+}
+
+fn parse_cuda_smoke_bytes(raw: Option<&str>) -> Result<usize, ()> {
+    let Some(raw) = raw else {
+        return Ok(256);
+    };
+
+    let size_bytes = raw.parse::<usize>().map_err(|error| {
+        eprintln!("failed to parse CUDA smoke byte size '{}': {}", raw, error);
+    })?;
+    if size_bytes == 0 {
+        eprintln!("CUDA smoke byte size must be greater than zero");
+        return Err(());
+    }
+
+    Ok(size_bytes)
+}
+
+fn parse_cuda_smoke_elements(raw: Option<&str>) -> Result<usize, ()> {
+    let Some(raw) = raw else {
+        return Ok(64);
+    };
+
+    let element_count = raw.parse::<usize>().map_err(|error| {
+        eprintln!(
+            "failed to parse CUDA smoke tensor element count '{}': {}",
+            raw, error
+        );
+    })?;
+    if element_count == 0 {
+        eprintln!("CUDA smoke tensor element count must be greater than zero");
+        return Err(());
+    }
+
+    Ok(element_count)
+}
+
+fn build_cuda_smoke_payload(size_bytes: usize) -> Vec<u8> {
+    (0..size_bytes)
+        .map(|index| ((index.saturating_mul(31) + 17) % 251) as u8)
+        .collect()
+}
+
+fn build_cuda_smoke_tensor_payload(element_count: usize) -> Vec<f32> {
+    (0..element_count)
+        .map(|index| index as f32 * 0.25 - 1.5)
+        .collect()
 }
 
 fn inspect_hf(path: Option<&str>) -> Result<(), ()> {
@@ -2138,6 +2379,18 @@ mod tests {
         assert_eq!(common_prefix_len(&[1, 2, 3, 4], &[1, 2, 9]), 2);
         assert_eq!(common_prefix_len(&[1, 2], &[1, 2, 3]), 2);
         assert_eq!(common_prefix_len(&[7, 8], &[9, 8]), 0);
+    }
+
+    #[test]
+    fn build_cuda_smoke_payload_is_nonzero_and_deterministic() {
+        let payload = build_cuda_smoke_payload(8);
+        assert_eq!(payload, vec![17, 48, 79, 110, 141, 172, 203, 234]);
+    }
+
+    #[test]
+    fn build_cuda_smoke_tensor_payload_is_deterministic() {
+        let payload = build_cuda_smoke_tensor_payload(6);
+        assert_eq!(payload, vec![-1.5, -1.25, -1.0, -0.75, -0.5, -0.25]);
     }
 
     #[test]

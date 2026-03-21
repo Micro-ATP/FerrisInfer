@@ -5,8 +5,9 @@ use ferrisinfer_core::{DeviceKind, ExecutionConfig, FerrisError, Result, Tensor}
 use crate::backend::{Backend, BackendAvailability, BackendCapabilities};
 
 pub use nvidia::{
-    probe_nvidia_cuda, NvidiaCudaBackend, NvidiaCudaDeviceInfo, NvidiaCudaDriverVersion,
-    NvidiaCudaProbe,
+    probe_nvidia_cuda, NvidiaCudaBackend, NvidiaCudaContext, NvidiaCudaDeviceBuffer,
+    NvidiaCudaDeviceInfo, NvidiaCudaDriverVersion, NvidiaCudaProbe, NvidiaCudaRuntime,
+    NvidiaCudaTensor,
 };
 
 #[derive(Debug, Clone)]

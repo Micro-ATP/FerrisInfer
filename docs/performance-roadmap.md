@@ -288,6 +288,15 @@ optimized path 才承担：
 - 错误边界清晰
 - 能跑通最小端到端链路
 
+当前这条线已经完成了第一批基础设施：
+
+- driver 动态探测与设备枚举
+- primary context retain/release
+- device buffer 分配、释放与 host <-> device copy
+- CLI 级 probe / smoke 验证
+
+下一步就应该把这层原始 buffer 往上推进到真正可承载 runtime 数据结构的 tensor storage，再开始最小 kernel 路径。
+
 退出条件：
 
 - CUDA backend 能跑通最小 decoder-only 单轮生成
@@ -419,8 +428,9 @@ FerrisInfer 的项目原则决定了 NVIDIA 路线不能简单照搬外部框架
 9. 已完成：把 paged KV prototype 推进到 block table / prefix sharing 的最小原型，并打通 prefix handle / prefix copy 的底层接口
 10. 已完成：把 prefix-aware scheduler reference heuristic 做起来，支持 shared-prefix prompt reuse 与 reused token profiling
 11. 已完成：引入 PrefixIndex 与元数据级 PrefixBlockManager，并把 scheduler 切到 prefix-index 查询路径
-12. 已完成：为 NVIDIA CUDA 引入 driver 动态探测、设备枚举与 backend 基础抽象，并接入 CLI 可观测输出
-13. 下一步：把 block manager / prefix index 从元数据推进到真实 page refcount / page sharing，同时开始 CUDA context / device buffer / host-device copy 基础设施，保持 CPU 跨平台基线不回退
+12. 已完成：为 NVIDIA CUDA 引入 driver 动态探测、设备枚举、context / device buffer / host-device copy 基础设施，并接入 CLI 可观测输出与 smoke 验证
+13. 已完成：把 CUDA 基础设施从 driver probe 推进到可实际 retain context、分配 device buffer、执行 host-device 往返拷贝的最小 runtime base
+14. 下一步：把 block manager / prefix index 从元数据推进到真实 page refcount / page sharing，同时继续把 CUDA 从原始 buffer 推进到 tensor storage 与第一批基础 kernel（zero/fill/copy -> matmul / attention），保持 CPU 跨平台基线不回退
 
 这是当前最稳、也最接近长期目标的路线。
 
