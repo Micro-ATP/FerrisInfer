@@ -131,33 +131,31 @@ impl PrefixHandle {
 #[derive(Debug, Clone)]
 struct PagedKvCachePage {
     id: KvCachePageId,
-    start_position: usize,
+    assigned_logical_block_index: Option<usize>,
     committed_tokens: usize,
     key: Tensor,
     value: Tensor,
 }
 
 impl PagedKvCachePage {
-    fn new(
-        page_id: KvCachePageId,
-        start_position: usize,
-        page_size: usize,
-        config: &KvCacheConfig,
-    ) -> Result<Self> {
+    fn new(page_id: KvCachePageId, page_size: usize, config: &KvCacheConfig) -> Result<Self> {
         let shape = Shape::from_slice(&[page_size, config.num_kv_heads, config.head_dim])?;
         Ok(Self {
             id: page_id,
-            start_position,
+            assigned_logical_block_index: None,
             committed_tokens: 0,
             key: Tensor::zeros(config.dtype, shape.clone())?,
             value: Tensor::zeros(config.dtype, shape)?,
         })
     }
 
-    fn info(&self) -> KvCachePageInfo {
+    fn info(&self, page_size: usize) -> KvCachePageInfo {
         KvCachePageInfo {
             page_id: self.id,
-            start_position: self.start_position,
+            start_position: self
+                .assigned_logical_block_index
+                .unwrap_or(0)
+                .saturating_mul(page_size),
             token_count: self.committed_tokens,
         }
     }
@@ -169,6 +167,8 @@ pub struct PagedKvCacheStorage {
     page_size: usize,
     layer_views: Vec<KvCacheLayer>,
     layer_pages: Vec<Vec<PagedKvCachePage>>,
+    layer_block_tables: Vec<Vec<Option<KvCachePageId>>>,
+    layer_free_page_ids: Vec<Vec<KvCachePageId>>,
 }
 
 impl PagedKvCacheStorage {
@@ -189,6 +189,8 @@ impl PagedKvCacheStorage {
         let page_count = config.max_sequence_length.div_ceil(page_size);
         let mut layer_views = Vec::with_capacity(config.num_layers);
         let mut layer_pages = Vec::with_capacity(config.num_layers);
+        let mut layer_block_tables = Vec::with_capacity(config.num_layers);
+        let mut layer_free_page_ids = Vec::with_capacity(config.num_layers);
 
         for _ in 0..config.num_layers {
             layer_views.push(KvCacheLayer {
@@ -200,12 +202,13 @@ impl PagedKvCacheStorage {
             for page_index in 0..page_count {
                 pages.push(PagedKvCachePage::new(
                     KvCachePageId::new(page_index),
-                    page_index * page_size,
                     page_size,
                     &config,
                 )?);
             }
             layer_pages.push(pages);
+            layer_block_tables.push(vec![None; page_count]);
+            layer_free_page_ids.push(initial_free_page_ids(page_count));
         }
 
         Ok(Self {
@@ -213,6 +216,8 @@ impl PagedKvCacheStorage {
             page_size,
             layer_views,
             layer_pages,
+            layer_block_tables,
+            layer_free_page_ids,
         })
     }
 
@@ -224,11 +229,31 @@ impl PagedKvCacheStorage {
         self.layer_pages.first().map(Vec::len).unwrap_or(0)
     }
 
+    pub fn allocated_page_count(&self, layer_index: usize) -> Result<usize> {
+        Ok(self
+            .layer_block_assignments(layer_index)?
+            .iter()
+            .filter(|page_id| page_id.is_some())
+            .count())
+    }
+
+    pub fn free_page_count(&self, layer_index: usize) -> Result<usize> {
+        self.layer_free_page_ids
+            .get(layer_index)
+            .map(Vec::len)
+            .ok_or_else(|| {
+                FerrisError::new(
+                    ErrorKind::InvalidShape,
+                    format!("KV cache layer index out of bounds: {layer_index}"),
+                )
+            })
+    }
+
     pub fn page_infos(&self, layer_index: usize) -> Result<Vec<KvCachePageInfo>> {
         Ok(self
             .layer_pages(layer_index)?
             .iter()
-            .map(PagedKvCachePage::info)
+            .map(|page| page.info(self.page_size))
             .collect())
     }
 
@@ -240,14 +265,24 @@ impl PagedKvCacheStorage {
         validate_prefix_length(&self.config, token_count)?;
 
         let mut remaining_tokens = token_count;
-        let mut logical_block_index = 0usize;
-        let mut block_table = Vec::new();
+        let logical_block_count = token_count.div_ceil(self.page_size);
+        let block_assignments = self.layer_block_assignments(layer_index)?;
+        let mut block_table = Vec::with_capacity(logical_block_count);
 
-        for page in self.layer_pages(layer_index)? {
-            if remaining_tokens == 0 {
-                break;
-            }
-
+        for logical_block_index in 0..logical_block_count {
+            let page_id = block_assignments
+                .get(logical_block_index)
+                .copied()
+                .flatten()
+                .ok_or_else(|| {
+                    FerrisError::new(
+                        ErrorKind::Runtime,
+                        format!(
+                            "KV cache block table missing physical page for logical block {logical_block_index}"
+                        ),
+                    )
+                })?;
+            let page = self.layer_page(layer_index, page_id)?;
             let tokens_from_page = remaining_tokens.min(self.page_size);
             if page.committed_tokens < tokens_from_page {
                 return Err(FerrisError::new(
@@ -261,11 +296,10 @@ impl PagedKvCacheStorage {
 
             block_table.push(KvBlockTableEntry {
                 logical_block_index,
-                block_id: KvBlockId::new(page.id.raw()),
+                block_id: KvBlockId::new(page_id.raw()),
                 start_position: logical_block_index * self.page_size,
                 token_count: tokens_from_page,
             });
-            logical_block_index += 1;
             remaining_tokens -= tokens_from_page;
         }
 
@@ -299,7 +333,7 @@ impl PagedKvCacheStorage {
         let slot_width = self.slot_width();
         for (layer_index, entries) in handle.layer_block_tables.iter().enumerate() {
             for entry in entries {
-                let source_page = source.layer_page_by_id(layer_index, entry.block_id)?;
+                let source_page = source.layer_page_by_block_id(layer_index, entry.block_id)?;
                 if source_page.committed_tokens < entry.token_count {
                     return Err(FerrisError::new(
                         ErrorKind::Runtime,
@@ -325,33 +359,22 @@ impl PagedKvCacheStorage {
                     })?;
                 let key_values = source_page.key.as_f32_slice()?;
                 let value_values = source_page.value.as_f32_slice()?;
-                let layer_view = self.layer_views.get_mut(layer_index).ok_or_else(|| {
-                    FerrisError::new(
-                        ErrorKind::InvalidShape,
-                        format!("KV cache layer index out of bounds: {layer_index}"),
-                    )
-                })?;
-                let dest_page = self
-                    .layer_pages
-                    .get_mut(layer_index)
-                    .and_then(|pages| pages.get_mut(entry.logical_block_index))
-                    .ok_or_else(|| {
-                        FerrisError::new(
-                            ErrorKind::InvalidShape,
-                            format!(
-                                "KV cache destination block index out of bounds for layer {layer_index}: {}",
-                                entry.logical_block_index
-                            ),
-                        )
-                    })?;
+                let dest_page_id =
+                    self.allocate_page_for_logical_block(layer_index, entry.logical_block_index)?;
 
-                layer_view
-                    .key
-                    .copy_from_f32_slice_at(layer_element_offset, &key_values[..token_elements])?;
-                layer_view.value.copy_from_f32_slice_at(
-                    layer_element_offset,
-                    &value_values[..token_elements],
-                )?;
+                {
+                    let layer_view = self.layer_view_mut(layer_index)?;
+                    layer_view.key.copy_from_f32_slice_at(
+                        layer_element_offset,
+                        &key_values[..token_elements],
+                    )?;
+                    layer_view.value.copy_from_f32_slice_at(
+                        layer_element_offset,
+                        &value_values[..token_elements],
+                    )?;
+                }
+
+                let dest_page = self.layer_page_mut(layer_index, dest_page_id)?;
                 dest_page
                     .key
                     .copy_from_f32_slice_at(0, &key_values[..token_elements])?;
@@ -369,6 +392,15 @@ impl PagedKvCacheStorage {
         self.config.num_kv_heads * self.config.head_dim
     }
 
+    fn layer_view_mut(&mut self, layer_index: usize) -> Result<&mut KvCacheLayer> {
+        self.layer_views.get_mut(layer_index).ok_or_else(|| {
+            FerrisError::new(
+                ErrorKind::InvalidShape,
+                format!("KV cache layer index out of bounds: {layer_index}"),
+            )
+        })
+    }
+
     fn layer_pages(&self, layer_index: usize) -> Result<&[PagedKvCachePage]> {
         self.layer_pages
             .get(layer_index)
@@ -381,22 +413,139 @@ impl PagedKvCacheStorage {
             })
     }
 
-    fn layer_page_by_id(
-        &self,
-        layer_index: usize,
-        block_id: KvBlockId,
-    ) -> Result<&PagedKvCachePage> {
+    fn layer_block_assignments(&self, layer_index: usize) -> Result<&[Option<KvCachePageId>]> {
+        self.layer_block_tables
+            .get(layer_index)
+            .map(Vec::as_slice)
+            .ok_or_else(|| {
+                FerrisError::new(
+                    ErrorKind::InvalidShape,
+                    format!("KV cache layer index out of bounds: {layer_index}"),
+                )
+            })
+    }
+
+    fn layer_page(&self, layer_index: usize, page_id: KvCachePageId) -> Result<&PagedKvCachePage> {
         self.layer_pages(layer_index)?
-            .get(block_id.raw())
+            .get(page_id.raw())
             .ok_or_else(|| {
                 FerrisError::new(
                     ErrorKind::InvalidShape,
                     format!(
-                        "KV cache block id out of bounds for layer {layer_index}: {}",
-                        block_id.raw()
+                        "KV cache page id out of bounds for layer {layer_index}: {}",
+                        page_id.raw()
                     ),
                 )
             })
+    }
+
+    fn layer_page_by_block_id(
+        &self,
+        layer_index: usize,
+        block_id: KvBlockId,
+    ) -> Result<&PagedKvCachePage> {
+        self.layer_page(layer_index, KvCachePageId::new(block_id.raw()))
+    }
+
+    fn layer_page_mut(
+        &mut self,
+        layer_index: usize,
+        page_id: KvCachePageId,
+    ) -> Result<&mut PagedKvCachePage> {
+        self.layer_pages
+            .get_mut(layer_index)
+            .and_then(|pages| pages.get_mut(page_id.raw()))
+            .ok_or_else(|| {
+                FerrisError::new(
+                    ErrorKind::InvalidShape,
+                    format!(
+                        "KV cache page id out of bounds for layer {layer_index}: {}",
+                        page_id.raw()
+                    ),
+                )
+            })
+    }
+
+    fn allocate_page_for_logical_block(
+        &mut self,
+        layer_index: usize,
+        logical_block_index: usize,
+    ) -> Result<KvCachePageId> {
+        let existing_page_id = self
+            .layer_block_tables
+            .get(layer_index)
+            .and_then(|block_table| block_table.get(logical_block_index))
+            .copied()
+            .flatten();
+        if let Some(page_id) = existing_page_id {
+            return Ok(page_id);
+        }
+
+        let page_id = {
+            let free_page_ids = self
+                .layer_free_page_ids
+                .get_mut(layer_index)
+                .ok_or_else(|| {
+                    FerrisError::new(
+                        ErrorKind::InvalidShape,
+                        format!("KV cache layer index out of bounds: {layer_index}"),
+                    )
+                })?;
+            free_page_ids.pop().ok_or_else(|| {
+                FerrisError::new(
+                    ErrorKind::Runtime,
+                    format!("KV cache layer {layer_index} ran out of free pages"),
+                )
+            })?
+        };
+
+        {
+            let block_table = self
+                .layer_block_tables
+                .get_mut(layer_index)
+                .ok_or_else(|| {
+                    FerrisError::new(
+                        ErrorKind::InvalidShape,
+                        format!("KV cache layer index out of bounds: {layer_index}"),
+                    )
+                })?;
+            let slot = block_table.get_mut(logical_block_index).ok_or_else(|| {
+                FerrisError::new(
+                    ErrorKind::InvalidShape,
+                    format!(
+                        "KV cache logical block index out of bounds for layer {layer_index}: {logical_block_index}"
+                    ),
+                )
+            })?;
+            *slot = Some(page_id);
+        }
+
+        let page = self.layer_page_mut(layer_index, page_id)?;
+        page.assigned_logical_block_index = Some(logical_block_index);
+        page.committed_tokens = 0;
+        Ok(page_id)
+    }
+
+    fn reset_page_assignments(&mut self) {
+        let page_count = self.page_count_per_layer();
+
+        for pages in &mut self.layer_pages {
+            for page in pages {
+                page.assigned_logical_block_index = None;
+                page.committed_tokens = 0;
+            }
+        }
+
+        for block_table in &mut self.layer_block_tables {
+            for slot in block_table.iter_mut() {
+                *slot = None;
+            }
+        }
+
+        for free_page_ids in &mut self.layer_free_page_ids {
+            free_page_ids.clear();
+            free_page_ids.extend(initial_free_page_ids(page_count));
+        }
     }
 
     fn validate_prefix_compatibility(&self, source: &Self, handle: &PrefixHandle) -> Result<()> {
@@ -453,7 +602,7 @@ impl PagedKvCacheStorage {
         }
 
         let slot_width = self.slot_width();
-        let page_index = position / self.page_size;
+        let logical_block_index = position / self.page_size;
         let page_offset = position % self.page_size;
         let page_element_offset = page_offset.checked_mul(slot_width).ok_or_else(|| {
             FerrisError::new(ErrorKind::Runtime, "KV cache page write offset overflow")
@@ -461,32 +610,19 @@ impl PagedKvCacheStorage {
         let layer_element_offset = position.checked_mul(slot_width).ok_or_else(|| {
             FerrisError::new(ErrorKind::Runtime, "KV cache write offset overflow")
         })?;
+        let page_id = self.allocate_page_for_logical_block(layer_index, logical_block_index)?;
 
-        let (layer_views, layer_pages) = (&mut self.layer_views, &mut self.layer_pages);
-        let layer_view = layer_views.get_mut(layer_index).ok_or_else(|| {
-            FerrisError::new(
-                ErrorKind::InvalidShape,
-                format!("KV cache layer index out of bounds: {layer_index}"),
-            )
-        })?;
-        let page = layer_pages
-            .get_mut(layer_index)
-            .and_then(|pages| pages.get_mut(page_index))
-            .ok_or_else(|| {
-                FerrisError::new(
-                    ErrorKind::InvalidShape,
-                    format!(
-                        "KV cache page index out of bounds for layer {layer_index}: {page_index}"
-                    ),
-                )
-            })?;
+        {
+            let layer_view = self.layer_view_mut(layer_index)?;
+            layer_view
+                .key
+                .copy_from_tensor_f32_at(layer_element_offset, key)?;
+            layer_view
+                .value
+                .copy_from_tensor_f32_at(layer_element_offset, value)?;
+        }
 
-        layer_view
-            .key
-            .copy_from_tensor_f32_at(layer_element_offset, key)?;
-        layer_view
-            .value
-            .copy_from_tensor_f32_at(layer_element_offset, value)?;
+        let page = self.layer_page_mut(layer_index, page_id)?;
         page.key.copy_from_tensor_f32_at(page_element_offset, key)?;
         page.value
             .copy_from_tensor_f32_at(page_element_offset, value)?;
@@ -494,7 +630,6 @@ impl PagedKvCacheStorage {
         Ok(())
     }
 }
-
 impl KvCacheStorage for PagedKvCacheStorage {
     fn kind(&self) -> KvCacheStorageKind {
         KvCacheStorageKind::Paged
@@ -518,11 +653,7 @@ impl KvCacheStorage for PagedKvCacheStorage {
     }
 
     fn reset(&mut self) {
-        for pages in &mut self.layer_pages {
-            for page in pages {
-                page.committed_tokens = 0;
-            }
-        }
+        self.reset_page_assignments();
     }
 
     fn write_f32(
@@ -580,24 +711,11 @@ impl KvCacheStorage for PagedKvCacheStorage {
         let slot_width = self.slot_width();
         let key_values = key.as_f32_slice()?;
         let value_values = value.as_f32_slice()?;
-        let (layer_views, layer_pages) = (&mut self.layer_views, &mut self.layer_pages);
-        let layer_view = layer_views.get_mut(layer_index).ok_or_else(|| {
-            FerrisError::new(
-                ErrorKind::InvalidShape,
-                format!("KV cache layer index out of bounds: {layer_index}"),
-            )
-        })?;
-        let pages = layer_pages.get_mut(layer_index).ok_or_else(|| {
-            FerrisError::new(
-                ErrorKind::InvalidShape,
-                format!("KV cache layer index out of bounds: {layer_index}"),
-            )
-        })?;
 
         let mut token_offset = 0usize;
         while token_offset < seq_len {
             let position = start_position + token_offset;
-            let page_index = position / self.page_size;
+            let logical_block_index = position / self.page_size;
             let page_offset = position % self.page_size;
             let tokens_in_page = (self.page_size - page_offset).min(seq_len - token_offset);
             let source_start = token_offset.checked_mul(slot_width).ok_or_else(|| {
@@ -618,23 +736,21 @@ impl KvCacheStorage for PagedKvCacheStorage {
             let layer_element_offset = position.checked_mul(slot_width).ok_or_else(|| {
                 FerrisError::new(ErrorKind::Runtime, "KV cache write offset overflow")
             })?;
-            let page = pages.get_mut(page_index).ok_or_else(|| {
-                FerrisError::new(
-                    ErrorKind::InvalidShape,
-                    format!(
-                        "KV cache page index out of bounds for layer {layer_index}: {page_index}"
-                    ),
-                )
-            })?;
+            let page_id = self.allocate_page_for_logical_block(layer_index, logical_block_index)?;
 
-            layer_view.key.copy_from_f32_slice_at(
-                layer_element_offset,
-                &key_values[source_start..source_end],
-            )?;
-            layer_view.value.copy_from_f32_slice_at(
-                layer_element_offset,
-                &value_values[source_start..source_end],
-            )?;
+            {
+                let layer_view = self.layer_view_mut(layer_index)?;
+                layer_view.key.copy_from_f32_slice_at(
+                    layer_element_offset,
+                    &key_values[source_start..source_end],
+                )?;
+                layer_view.value.copy_from_f32_slice_at(
+                    layer_element_offset,
+                    &value_values[source_start..source_end],
+                )?;
+            }
+
+            let page = self.layer_page_mut(layer_index, page_id)?;
             page.key.copy_from_f32_slice_at(
                 page_element_offset,
                 &key_values[source_start..source_end],
@@ -657,37 +773,14 @@ impl KvCacheStorage for PagedKvCacheStorage {
         let prefix_elements = prefix_element_count(&self.config, length)?;
         let mut key_values = Vec::with_capacity(prefix_elements);
         let mut value_values = Vec::with_capacity(prefix_elements);
-        let mut remaining_tokens = length;
 
-        for page in self.layer_pages(layer_index)? {
-            if remaining_tokens == 0 {
-                break;
-            }
-
-            let tokens_from_page = remaining_tokens.min(self.page_size);
-            if page.committed_tokens < tokens_from_page {
-                return Err(FerrisError::new(
-                    ErrorKind::Runtime,
-                    format!(
-                        "KV cache paged prefix read touched uncommitted tokens in page {}",
-                        page.id.raw()
-                    ),
-                ));
-            }
-
-            let page_elements = tokens_from_page.checked_mul(slot_width).ok_or_else(|| {
+        for entry in self.block_table(layer_index, length)? {
+            let page = self.layer_page_by_block_id(layer_index, entry.block_id())?;
+            let page_elements = entry.token_count().checked_mul(slot_width).ok_or_else(|| {
                 FerrisError::new(ErrorKind::Runtime, "KV cache paged prefix size overflow")
             })?;
             key_values.extend_from_slice(&page.key.as_f32_slice()?[..page_elements]);
             value_values.extend_from_slice(&page.value.as_f32_slice()?[..page_elements]);
-            remaining_tokens -= tokens_from_page;
-        }
-
-        if remaining_tokens != 0 {
-            return Err(FerrisError::new(
-                ErrorKind::Runtime,
-                "KV cache paged prefix read ran out of pages",
-            ));
         }
 
         let shape = Shape::from_slice(&[length, self.config.num_kv_heads, self.config.head_dim])?;
@@ -696,6 +789,10 @@ impl KvCacheStorage for PagedKvCacheStorage {
             Tensor::from_f32_vec(shape, value_values)?,
         ))
     }
+}
+
+fn initial_free_page_ids(page_count: usize) -> Vec<KvCachePageId> {
+    (0..page_count).rev().map(KvCachePageId::new).collect()
 }
 
 fn validate_config(config: &KvCacheConfig) -> Result<()> {
@@ -968,6 +1065,51 @@ mod tests {
         assert_eq!(page_infos[0].token_count(), 2);
         assert_eq!(page_infos[1].token_count(), 2);
         assert_eq!(page_infos[2].token_count(), 1);
+    }
+
+    #[test]
+    fn paged_storage_reuses_physical_page_ids_after_reset() {
+        let mut storage = PagedKvCacheStorage::new(
+            KvCacheConfig {
+                num_layers: 1,
+                num_kv_heads: 1,
+                head_dim: 2,
+                max_sequence_length: 8,
+                dtype: DType::F32,
+            },
+            2,
+        )
+        .unwrap();
+
+        let keys = Tensor::from_f32_vec(
+            Shape::from_slice(&[2, 1, 2]).unwrap(),
+            vec![1.0, 2.0, 3.0, 4.0],
+        )
+        .unwrap();
+        let values = Tensor::from_f32_vec(
+            Shape::from_slice(&[2, 1, 2]).unwrap(),
+            vec![5.0, 6.0, 7.0, 8.0],
+        )
+        .unwrap();
+
+        storage
+            .write_sequence_uncommitted_f32(0, 0, &keys, &values)
+            .unwrap();
+        assert_eq!(storage.allocated_page_count(0).unwrap(), 1);
+        assert_eq!(storage.free_page_count(0).unwrap(), 3);
+
+        storage.reset();
+        storage
+            .write_sequence_uncommitted_f32(0, 2, &keys, &values)
+            .unwrap();
+
+        let page_infos = storage.page_infos(0).unwrap();
+        assert_eq!(storage.allocated_page_count(0).unwrap(), 1);
+        assert_eq!(storage.free_page_count(0).unwrap(), 3);
+        assert_eq!(page_infos[0].page_id().raw(), 0);
+        assert_eq!(page_infos[0].start_position(), 2);
+        assert_eq!(page_infos[0].token_count(), 2);
+        assert_eq!(page_infos[1].token_count(), 0);
     }
 
     #[test]
